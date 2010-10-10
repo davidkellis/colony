@@ -1,0 +1,37 @@
+Colony is a small distributed task library.
+
+Depends on:
+
+beanstalkd http://kr.github.com/beanstalkd/
+mongodb http://www.mongodb.org/
+zeromq http://www.zeromq.org/
+
+
+Getting started:
+
+1. Install dependencies. This is how I did it:
+
+beanstalkd:
+sudo port install beanstalkd
+
+zeromq:
+sudo port install zeromq
+
+mongodb:
+Download and install mongodb 1.6.3 from http://www.mongodb.org/downloads
+
+beanstalk-client gem:
+gem install beanstalk-client
+
+zmq gem:
+gem install zmq -- --with-zmq-dir=/opt/local      (if you're using macports)
+gem install zmq                                   (otherwise)
+
+Note: I tried to install the zmq gem with "gem install zmq", but that failed since I installed zeromq via macports.
+
+mongoid gem:
+gem install mongoid --pre
+
+2. 
+
+Licensed under the MIT license.
