@@ -4,7 +4,6 @@ Depends on:
 
 beanstalkd http://kr.github.com/beanstalkd/
 mongodb http://www.mongodb.org/
-zeromq http://www.zeromq.org/
 
 
 Getting started:
@@ -14,24 +13,22 @@ Getting started:
 beanstalkd:
 sudo port install beanstalkd
 
-zeromq:
-sudo port install zeromq
-
 mongodb:
 Download and install mongodb 1.6.3 from http://www.mongodb.org/downloads
 
 beanstalk-client gem:
 gem install beanstalk-client
 
-zmq gem:
-gem install zmq -- --with-zmq-dir=/opt/local      (if you're using macports)
-gem install zmq                                   (otherwise)
-
-Note: I tried to install the zmq gem with "gem install zmq", but that failed since I installed zeromq via macports.
-
 mongoid gem:
 gem install mongoid --pre
 
-2. 
+2. Try out the example in the /example directory.
+
+First run mongod and beanstalkd.
+
+Then run example/queen.rb, followed by example/worker.rb, then finally simple.rb.
+
+NOTE: This example isn't fully working yet, but it gives you and idea of what I'm trying to do.
+
 
 Licensed under the MIT license.
