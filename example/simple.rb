@@ -48,6 +48,15 @@ def main
   result5 = c.task("MyFunctions.sqrt", [29], true)
   puts "c.task(\"MyFunctions.sqrt\", [29], true) -> #{result5.value}"
 
+  
+  puts '************** Callbacks **************'
+
+  puts "This task should cause the worker process to print a message with this"
+  puts "task's redis id and this task's result (i.e. return value) URI."
+  result6 = c.task("MyFunctions.sqrt", [25], true, :print_hi_on_worker)
+  puts "c.task(\"MyFunctions.sqrt\", [25], true, :print_hi_on_worker) -> #{result5.value}"
+
+
   # j = c.job
   # rand_numbers = 100.times.map { rand(100) }
   # slices = rand_numbers.each_slice(3)

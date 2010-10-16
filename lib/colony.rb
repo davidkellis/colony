@@ -62,6 +62,10 @@ module Colony
     end
     
     def full_id
+      key
+    end
+    
+    def tube_name
       key.gsub(":", "-")
     end
   end
@@ -93,7 +97,7 @@ module Colony
     def enqueue_notification(bs_pool = nil)
       @pool = bs_pool if bs_pool
       
-      @pool.use(self.full_id)
+      @pool.use(self.tube_name)
       @pool.yput(self)
     end
     
@@ -209,7 +213,7 @@ module Colony
       
       # listen for task completion notification if the task is set up to do that
       if @task.notify && @pool
-        @pool.watch(@task.full_id)           # subscribe to the task-specific tube
+        @pool.watch(@task.tube_name)           # subscribe to the task-specific tube
         
         begin
           
@@ -233,7 +237,7 @@ module Colony
         # rescue Beanstalk::TimedOut => e
         #   retry
         ensure
-          @pool.ignore(@task.full_id)       # stop watching the queue
+          @pool.ignore(@task.tube_name)       # stop watching the queue
         end
       end
       
