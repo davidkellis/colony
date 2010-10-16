@@ -27,7 +27,10 @@ cd ohm
 gem build ohm.gemspec
 gem install ohm-0.1.0.gem
 
-2. Try out the example in the /example directory.
+2. Clone colony:
+git clone git://github.com/davidkellis/colony.git
+
+3. Try out the example in the /example directory.
 
 First run redis and beanstalkd.
 
