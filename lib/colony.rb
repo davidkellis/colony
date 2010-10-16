@@ -1,5 +1,3 @@
-# require 'mongo'
-# require 'mongoid'
 require 'redis'
 require 'ohm'
 require 'beanstalk-client'
@@ -11,7 +9,6 @@ TOPLEVEL = self
 module Colony
   # status states
   module States
-    
     # task states
     NEW = :new
     QUEUED = :queued
@@ -107,10 +104,6 @@ module Colony
     def value(timeout = nil)
       result_reference.value(timeout)
     end
-    
-    # def to_hash
-    #   super.merge(fn: fn, args: args, callback: callback)
-    # end
   end
   
   class SimpleTask < Ohm::Model
@@ -139,10 +132,6 @@ module Colony
     def initialize(attrs = {})
       super(attrs.merge(type: Message::JOB_TASK))
     end
-    
-    # def to_hash
-    #   super.merge(job_id: job_id)
-    # end
   end
   
   class Client
@@ -291,8 +280,19 @@ module Colony
       end
     end
     
+    # The task.fn must either reference a top-level function/method or it must
+    # be in dotted form, s.t. the substring to the right of the right-most period is the method name
+    # and the substring to the left of the right-most period is the object on which to invoke the method.
     def invoke(task)
-      TOPLEVEL.send(task.fn, *task.args)
+      fn = task.fn.to_s
+      i = fn.rindex('.')
+      if i
+        obj = fn[0, i]
+        method = fn[i + 1, fn.length - (i + 1)]
+        eval(obj).send(method, *task.args)
+      else
+        TOPLEVEL.send(fn, *task.args)
+      end
     end
     
     # stores the result in mongodb and returns the document id

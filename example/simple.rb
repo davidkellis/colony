@@ -41,6 +41,12 @@ def main
     val = result4.value
     puts "c.task(:multiply, [4, 5, 6], true) -> #{val}"
   end until val
+  
+  
+  puts '************** Module Method **************'
+  
+  result5 = c.task("MyFunctions.sqrt", [29], true)
+  puts "c.task(\"MyFunctions.sqrt\", [29], true) -> #{result5.value}"
 
   # j = c.job
   # rand_numbers = 100.times.map { rand(100) }
