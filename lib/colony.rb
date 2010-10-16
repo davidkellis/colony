@@ -300,7 +300,6 @@ module Colony
       result_id = UUIDTools::UUID.random_create.to_s
       @local_redis_server.set(result_id, result)
       
-      # result_uri = "mongodb://#{host}:#{port}/#{db_name}/#{coll_name}/#{result_id}"
       result_uri = "redis://#{@local_redis_server.client.host}:#{@local_redis_server.client.port}/#{@local_redis_server.client.db}/#{result_id}"
       result_uri
     end

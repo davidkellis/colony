@@ -27,6 +27,11 @@ cd ohm
 gem build ohm.gemspec
 gem install ohm-0.1.0.gem
 
+leiri gem:
+git clone git://github.com/davidkellis/leiriparser.git
+cd leiriparser
+./install.sh
+
 2. Clone colony:
 git clone git://github.com/davidkellis/colony.git
 
