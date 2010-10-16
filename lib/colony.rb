@@ -1,38 +1,180 @@
-require 'mongo'
-require 'mongoid'
+# require 'mongo'
+# require 'mongoid'
+require 'redis'
+require 'ohm'
 require 'beanstalk-client'
 require 'leiri'
+require 'uuidtools'
 
 TOPLEVEL = self
 
 module Colony
-  # tube names
-  DEFAULT_TUBE = "default"
-  NEW_TASK_TUBE = "colony_new"
-  STATUS_TUBE = "colony_status"
-  
   # status states
-  STATUS_COMPLETE = "done"
-  STATUS_RUNNING = "running"
-  STATUS_UNKNOWN = "unknown"
+  module States
+    
+    # task states
+    NEW = :new
+    QUEUED = :queued
+    NOT_QUEUED = :notqueued
+    RUNNING = :running
+    CALLBACK = :callback
+    COMPLETE = :done
+    UNKNOWN = :unknown
+  end
   
-  # message types
-  MSG_STATUS_QUERY = "status"
-  MSG_TASK_RESULT = "result"
-  MSG_JOB_INFO = "job"
+  module Tubes
+    DEFAULT = :default
+    NEW_TASK = :colony_new
+    STATUS = :colony_status
+  end
   
-  class Client
-    def initialize(queues)
-      @pool = Beanstalk::Pool.new(queues)
-      # @pool.ignore(DEFAULT_TUBE)
+  module Message
+    # Message types
+    SIMPLE_TASK = :task
+    JOB_TASK = :jobtask
+    JOB = :job
+
+    STATUS_QUERY = :statusq
+    STATUS = :status
+    INFO = :info
+    RESULT = :result
+    
+    def self.included(mod)
+      mod.module_eval do
+        attribute :type
+        
+        # the pool attribute is an instance of Beanstalk::Pool
+        attr_accessor :pool
+      end
+    end
+
+    # TODO: keep this, or use the default id generation?
+    def initialize_id
+      @id ||= UUIDTools::UUID.random_create.to_s
     end
     
-    def task(fn_name, args_array, notify_on_completion = nil, callback_fn = nil)
-      task = {fn: fn_name, args: args_array, callback: callback_fn, notify: notify_on_completion}
+    def enqueue(tube, bs_pool = nil)
+      @pool = bs_pool if bs_pool
       
-      @pool.use(NEW_TASK_TUBE)
-      task_id = @pool.yput(task)
-      ResultReference.new(task_id, @pool)
+      @pool.use(tube)
+      @pool.yput(self)
+    end
+    
+    def to_hash
+      super.merge(type: type)
+    end
+    
+    def full_id
+      key.gsub(":", "-")
+    end
+  end
+  
+  module TaskMessage
+    def self.included(mod)
+      mod.module_eval do
+        include Message
+        
+        attribute :fn
+        attribute :args
+        attribute :callback
+        attribute :result_uri
+        attribute :notify
+        attribute :status
+      end
+    end
+    
+    # bs_pool is a Beanstalk::Pool object
+    def enqueue_callback(tube, bs_pool = nil)
+      @pool = bs_pool if bs_pool
+      
+      callback_task = SimpleTask.create(fn: self.callback, args: [self.full_id, self.result_uri])
+      callback_task.pool = @pool
+      message_id = callback_task.enqueue(tube)
+    end
+    
+    # bs_pool is a Beanstalk::Pool object
+    def enqueue_notification(bs_pool = nil)
+      @pool = bs_pool if bs_pool
+      
+      @pool.use(self.full_id)
+      @pool.yput(self)
+    end
+    
+    def result_reference
+      @result_ref ||= ResultReference.new(self, @pool)
+    end
+    
+    def value(timeout = nil)
+      result_reference.value(timeout)
+    end
+    
+    # def to_hash
+    #   super.merge(fn: fn, args: args, callback: callback)
+    # end
+  end
+  
+  class SimpleTask < Ohm::Model
+    include TaskMessage
+    
+    def initialize(attrs = {})
+      super(attrs.merge(type: Message::SIMPLE_TASK))
+    end
+  end
+  
+  class Job < Ohm::Model
+    include Message
+    
+    collection :tasks, JobTask
+    
+    def initialize(attrs = {})
+      super(attrs.merge(type: Message::JOB))
+    end
+  end
+  
+  class JobTask < Ohm::Model
+    include TaskMessage
+    
+    attribute :job_id
+    
+    def initialize(attrs = {})
+      super(attrs.merge(type: Message::JOB_TASK))
+    end
+    
+    # def to_hash
+    #   super.merge(job_id: job_id)
+    # end
+  end
+  
+  class Client
+    def initialize(queues, global_redis_server = {})
+      @pool = Beanstalk::Pool.new(queues)
+      # @pool.ignore(TUBE_DEFAULT)
+      
+      Ohm.connect(global_redis_server)
+    end
+    
+    def task(fn_name, args_array, notify_on_complete = false, callback_fn = nil)
+      task = SimpleTask.create(status: States::NEW, 
+                               fn: fn_name, 
+                               args: args_array, 
+                               callback: callback_fn, 
+                               notify: notify_on_complete)
+      task.pool = @pool
+      message_id = task.enqueue(Tubes::NEW_TASK)
+      
+      # if the response was a numeric job id, then the task was successfully enqueued
+      if message_id.is_a? Numeric
+        task.status = States::QUEUED
+      else
+        # try to enqueue the task again
+        if task.enqueue(Tubes::NEW_TASK).is_a? Numeric
+          task.status = States::QUEUED
+        else
+          task.status = States::NOT_QUEUED
+        end
+      end
+      
+      task
     end
     
     # def job(tasks)
@@ -43,282 +185,124 @@ module Colony
   # should be used at once. It is safe to call ResultReference#value from different ResultReference objects
   # in different threads *as long as* they were generated from different Client objects.
   class ResultReference
-    def initialize(queued_task_id, mq_pool)
-      @task_id = queued_task_id
+    def initialize(task, mq_pool = nil)
+      @task = task
       @pool = mq_pool
-      @tube_name = "task#{@task_id}"
     end
     
-    def value
+    # download the task's result if the task's result_uri field is set
+    def download_result(task = nil)
+      return @result if @result
+
+      task ||= @task
+      
+      if task.result_uri
+        uri = LegacyExtendedIRI.new(task.result_uri)       # uri will be something like this: "redis://127.0.0.1:6379/0/12345"
+        db, result_id = uri.path.split('/').drop(1)
+      
+        redis = Redis.new(:host => uri.host || "127.0.0.1", :port => uri.port || 6379, :db => db || 0)
+        @result = redis.get(result_id)
+        redis.quit
+        
+        @result
+      end
+    end
+    
+    # The default timeout is "forever", i.e. wait indefinitely.
+    def value(timeout = nil)
       return @result if @result
       
-      @pool.watch(@tube_name)
-      msg = nil
+      # reload the task's result_uri from "global" redis
+      @task.reload!(:result_uri)
       
-      if @pool.peek_ready
-        msg = @pool.reserve(1)        # poll the queue for a pre-existing message. Timeout immediately if there is no message.
-      elsif !@query_attempted
-        query_task_status           # ask the queen to put our task's result_uri in the queue for us.
-        msg = @pool.reserve(1) if @pool.peek_ready  # poll the queue for a message. Timeout immediately if there is no message.
-        @query_attempted = true
-      end
+      # download the task's result if the task's result_uri field is set
+      download_result
       
-      if msg
-        msg.delete                  # remove the message from the queue
-        @pool.ignore(@tube_name)    # stop watching the queue
+      # listen for task completion notification if the task is set up to do that
+      if @task.notify && @pool
+        @pool.watch(@task.full_id)           # subscribe to the task-specific tube
         
-        status = msg.ybody
-        result = nil
-        
-        if status[:status] == STATUS_COMPLETE
-          result_uri = status[:result_uri]
-          uri = LegacyExtendedIRI.new(result_uri)
-          db_name, coll_name, result_id = uri.path.split('/').drop(1)
+        begin
+          
+          # if we already have a result_uri, just clear any message off the queue
+          if @task.result_uri
+            if @pool.peek_ready
+              msg = @pool.reserve(0)        # poll the queue for a pre-existing message. Timeout immediately if there is no message.
+              msg.delete if msg             # delete the message, we don't need it
+            end
+          else      # we don't already have a result_uri, so listen for one
+            msg = @pool.reserve(timeout)    # listen for a message; timeout if there is no message within the given timeout period.
+            if msg
+              msg.delete                    # remove the message from the queue
 
-          conn = Mongo::Connection.new(uri.host || "localhost", uri.port || 27017)
-          db = conn.db(db_name)
-          coll = db.collection(coll_name)
-          result = coll.find_one(BSON::ObjectID.from_string(result_id))
-          conn.close
-        end
+              notification_task = msg.ybody
+            
+              download_result(notification_task)
+            end
+          end
         
-        @result = result if result
-        @result    # returns a BSON::OrderedHash (which descends from Hash)
+        # rescue Beanstalk::TimedOut => e
+        #   retry
+        ensure
+          @pool.ignore(@task.full_id)       # stop watching the queue
+        end
       end
-    end
-    
-    def query_task_status
-      @pool.use(STATUS_TUBE)
-      @pool.yput({type: MSG_STATUS_QUERY, task_id: @task_id})
+      
+      @result
     end
   end
   
   class Worker
-    def initialize(queues, db_config_hash)
+    def initialize(queues, global_redis_server = {}, local_redis_server = {})
       @pool = Beanstalk::Pool.new(queues)
-      # @pool.ignore(DEFAULT_TUBE)
-      @pool.watch(NEW_TASK_TUBE)
+      # @pool.ignore(TUBE_DEFAULT)
+      @pool.watch(Tubes::NEW_TASK)
       
-      Mongoid.configure do |config|
-        master = db_config_hash[:master]    # of the form: {host: 'abc', port: 123, db: 'production'}
-        slaves = db_config_hash[:slaves]    # each of the form: {host: 'abc', port: 123, db: 'production'}
-        config.master = Mongo::Connection.new(master[:host] || "localhost", master[:port] || 27017).db(master[:db])
-        if slaves
-          config.slaves = slaves.map do |s|
-            Mongo::Connection.new(s[:host] || "localhost", s[:port] || 27017, :slave_ok => true).db(s[:db])
-          end
-        end
-        config.persist_in_safe_mode = false
-      end
+      Ohm.connect(global_redis_server)
+      
+      @local_redis_server = Redis.new(local_redis_server)
     end
     
     def start
-      host = Mongoid.master.connection.host
-      port = Mongoid.master.connection.port
-      db_name = Mongoid.master.name
-      coll_name = ComputedResult.collection_name
-      
       loop do
         job = @pool.reserve
         
         task = job.ybody
-        callback = task[:callback]
-        notify = task[:notify]
-        parent_job_id = task[:job_id]
-        task_id = job.id
+        
+        task.pool = @pool
+        
+        task.update(status: States::RUNNING)
         
         result = invoke(task)
         
-        result_id = store_result(task_id, result)
-        result_uri = "mongodb://#{host}:#{port}/#{db_name}/#{coll_name}/#{result_id}"
+        result_uri = store_result(result)
         
-        # we let the queen know of all our completed tasks, even if the task has no parent job.
-        enqueue_task_complete(parent_job_id, task_id, result_uri)
+        task.update(result_uri: result_uri, status: States::COMPLETE)
         
-        if callback
-          enqueue_task(callback, [task_id, result_uri])
+        if task.callback
+          task.enqueue_callback(Tubes::NEW_TASK)
         end
         
-        if notify
-          notify_task_complete(task_id, result_uri)
+        if task.notify
+          task.enqueue_notification
         end
         
         job.delete    # mark the job as complete
       end
-    end
-    
-    # send a message to the queen telling her that the task is complete
-    # and that its parent job is one step closer to being finished.
-    def enqueue_task_complete(job_id, task_id, result_uri)
-      status_msg = {type: MSG_STATUS_QUERY, status: STATUS_COMPLETE, job_id: job_id, task_id: task_id, result_uri: result_uri}
-      
-      @pool.use(STATUS_TUBE)
-      @pool.yput(status_msg)
-    end
-    
-    def enqueue_task(fn_name, args_array, notify_on_completion = nil, callback_fn = nil)
-      task = {fn: fn_name, args: args_array, callback: callback_fn, notify: notify_on_completion}
-
-      @pool.use(NEW_TASK_TUBE)
-      @pool.yput(task)
-    end
-    
-    def notify_task_complete(task_id, result_uri)
-      tube_name = "task#{task_id}"
-      status_msg = {type: MSG_STATUS_QUERY, status: STATUS_COMPLETE, result_uri: result_uri}
-      
-      @pool.use(tube_name)
-      @pool.yput(status_msg)
     end
     
     def invoke(task)
-      fn = task[:fn]
-      args = task[:args]
-      
-      TOPLEVEL.send(fn, *args)
+      TOPLEVEL.send(task.fn, *task.args)
     end
     
     # stores the result in mongodb and returns the document id
-    def store_result(task_id, result)
-      result = ComputedResult.create(task_id: task_id, value: result)
-      result.id
-    end
-  end
-  
-  class ComputedResult
-    include Mongoid::Document
-    
-    field :task_id
-    field :value
-  end
-  
-  class Queen
-    def initialize(queues, db_config_hash)
-      @pool = Beanstalk::Pool.new(queues)
-      # @pool.ignore(DEFAULT_TUBE)
-      @pool.watch(STATUS_TUBE)
+    def store_result(result)
+      result_id = UUIDTools::UUID.random_create.to_s
+      @local_redis_server.set(result_id, result)
       
-      Mongoid.configure do |config|
-        master = db_config_hash[:master]    # of the form: {host: 'abc', port: 123, db: 'production'}
-        slaves = db_config_hash[:slaves]    # each of the form: {host: 'abc', port: 123, db: 'production'}
-        config.master = Mongo::Connection.new(master[:host] || "localhost", master[:port] || 27017).db(master[:db])
-        if slaves
-          config.slaves = slaves.map do |s|
-            Mongo::Connection.new(s[:host] || "localhost", s[:port] || 27017, :slave_ok => true).db(s[:db])
-          end
-        end
-        config.persist_in_safe_mode = false
-      end
+      # result_uri = "mongodb://#{host}:#{port}/#{db_name}/#{coll_name}/#{result_id}"
+      result_uri = "redis://#{@local_redis_server.client.host}:#{@local_redis_server.client.port}/#{@local_redis_server.client.db}/#{result_id}"
+      result_uri
     end
-    
-    def process_message(msg)
-      case msg[:type]
-      when MSG_STATUS_QUERY
-        process_status_query(msg)
-      when MSG_JOB_INFO
-        process_job_info(msg)
-      when MSG_TASK_RESULT
-        process_task_result(msg)
-      end
-    end
-    
-    def process_status_query(msg)
-      status = msg[:status]
-      job_id = msg[:job_id]
-      task_id = msg[:task_id]
-      result_uri = msg[:result_uri]
-      
-      if status == STATUS_COMPLETE
-        notify_task_complete(task_id, result_uri)
-      end
-    end
-    
-    def process_job_info(msg)
-      task_count = msg[:task_count]
-      callback = msg[:callback]
-      notify = msg[:notify]
-      job_id = task[:job_id]
-      
-      j = Job.create(id: job_id, task_count: task_count, callback: callback, notify: notify)
-    end
-    
-    def process_task_result(msg)
-      job_id = task[:job_id]
-      task_id = task[:task_id]
-      result_uri = task[:result_uri]
-      
-      j = Job.find_one({job_id: job_id})
-      t = Task.create(task_id: task_id, result_uri: result_uri)
-
-      if j
-        j.tasks << t
-        
-        # the job is complete if the task_count equals the number of completed tasks
-        if j.task_count == j.tasks.count
-          if j.callback_fn
-            enqueue_task(j.callback_fn, [tasks])
-          end
-        
-          if j.notify_p
-            notify_job_complete(job_id, j.tasks)
-          end
-        end
-      end
-    end
-    
-    def start
-      loop do
-        job = @pool.reserve
-        
-        msg = job.ybody
-        
-        process_message(msg)
-        
-        job.delete    # mark the job as complete
-      end
-    end
-    
-    def notify_task_complete(task_id, result_uri)
-      tube_name = "task#{task_id}"
-      status_msg = {type: MSG_STATUS_QUERY, status: STATUS_COMPLETE, result_uri: result_uri}
-      
-      @pool.use(tube_name)
-      @pool.yput(status_msg)
-    end
-    
-    def notify_job_complete(job_id, tasks)
-      tube_name = "job#{job_id}"
-      status_msg = {type: MSG_STATUS_QUERY, status: STATUS_COMPLETE, tasks: tasks}
-      
-      @pool.use(tube_name)
-      @pool.yput(status_msg)
-    end
-    
-    def enqueue_task(fn_name, args_array, notify_on_completion = nil, callback_fn = nil)
-      task = {fn: fn_name, args: args_array, callback: callback_fn, notify: notify_on_completion}
-
-      @pool.use(NEW_TASK_TUBE)
-      @pool.yput(task)
-    end
-  end
-  
-  class Task
-    include Mongoid::Document
-    
-    embedded_in :job, :inverse_of => :tasks
-    
-    field :task_id
-    field :result_uri
-  end
-  
-  class Job
-    include Mongoid::Document
-    
-    embeds_many :tasks
-    
-    field :job_id
-    field :task_count
-    field :callback_fn
-    field :notify_p
   end
 end

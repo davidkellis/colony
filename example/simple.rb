@@ -3,13 +3,44 @@ $: << File.join(File.expand_path(File.dirname(__FILE__)), "..", "lib")
 require 'colony'
 
 def main
-  c = Colony::Client.new(['localhost:11300'])
+  c = Colony::Client.new(['localhost:11300'], {host: 'localhost'})
 
-  result1 = c.task(:multiply, [1, 2, 3], true)
-  result2 = c.task(:multiply, [4, 5, 6], true)
+  puts '************** POLLING **************'
 
-  puts result1.value
-  puts result2.value
+  result1 = c.task(:multiply, [1, 2, 3])
+  puts "result1 = c.task(:multiply, [1, 2, 3])"
+
+  begin
+    val = result1.value
+    puts "result1.value -> #{val}"
+  end until val
+
+  result2 = c.task(:multiply, [4, 5, 6])
+  puts "result2 = c.task(:multiply, [4, 5, 6])"
+
+  begin
+    val = result2.value
+    puts "result2.value -> #{val}"
+  end until val
+
+
+  puts '************** BLOCKING **************'
+
+  result3 = c.task(:multiply, [1, 2, 3], true)
+  puts "result3 = c.task(:multiply, [1, 2, 3], true)"
+
+  begin
+    val = result3.value
+    puts "c.task(:multiply, [1, 2, 3], true) -> #{val}"
+  end until val
+  
+  result4 = c.task(:multiply, [4, 5, 6], true)
+  puts "result4 = c.task(:multiply, [4, 5, 6], true)"
+
+  begin
+    val = result4.value
+    puts "c.task(:multiply, [4, 5, 6], true) -> #{val}"
+  end until val
 
   # j = c.job
   # rand_numbers = 100.times.map { rand(100) }

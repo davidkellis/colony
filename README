@@ -2,9 +2,8 @@ Colony is a small distributed task library.
 
 Depends on:
 
-beanstalkd http://kr.github.com/beanstalkd/
-mongodb http://www.mongodb.org/
-
+beanstalkd: http://kr.github.com/beanstalkd/
+redis: http://code.google.com/p/redis/
 
 Getting started:
 
@@ -13,22 +12,27 @@ Getting started:
 beanstalkd:
 sudo port install beanstalkd
 
-mongodb:
-Download and install mongodb 1.6.3 from http://www.mongodb.org/downloads
-
 beanstalk-client gem:
 gem install beanstalk-client
 
-mongoid gem:
-gem install mongoid --pre
+redis:
+sudo port install redis
+
+redis gem:
+gem install redis
+
+ohm gem:
+git clone http://github.com/davidkellis/ohm
+cd ohm
+gem build ohm.gemspec
+gem install ohm-0.1.0.gem
 
 2. Try out the example in the /example directory.
 
-First run mongod and beanstalkd.
+First run redis and beanstalkd.
 
-Then run example/queen.rb, followed by example/worker.rb, then finally simple.rb.
+Then run example/worker.rb, followed by example/simple.rb.
 
-NOTE: This example isn't fully working yet, but it gives you and idea of what I'm trying to do.
 
 
 Licensed under the MIT license.
