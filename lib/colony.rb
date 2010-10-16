@@ -84,29 +84,94 @@ module Colony
       end
     end
     
-    # bs_pool is a Beanstalk::Pool object
-    def enqueue_callback(tube, bs_pool = nil)
-      @pool = bs_pool if bs_pool
-      
+    def enqueue_callback(tube)
       callback_task = SimpleTask.create(fn: self.callback, args: [self.full_id, self.result_uri])
       callback_task.pool = @pool
       message_id = callback_task.enqueue(tube)
     end
     
-    # bs_pool is a Beanstalk::Pool object
-    def enqueue_notification(bs_pool = nil)
-      @pool = bs_pool if bs_pool
-      
+    def enqueue_notification
       @pool.use(self.tube_name)
       @pool.yput(self)
     end
     
-    def result_reference
-      @result_ref ||= ResultReference.new(self, @pool)
+    # The default timeout is "forever", i.e. wait indefinitely.
+    def value(timeout = nil)
+      return @result if @result
+      
+      poll_for_result
+      
+      # listen for task completion notification if the task is set up to do that
+      if notify && @pool
+        @pool.watch(tube_name)           # subscribe to the task-specific tube
+        
+        begin
+          
+          # if we already have a result_uri, just clear any message off the queue
+          if result_uri
+            if @pool.peek_ready
+              msg = @pool.reserve(0)        # poll the queue for a pre-existing message. Timeout immediately if there is no message.
+              msg.delete if msg             # delete the message, we don't need it
+            end
+          else      # we don't already have a result_uri, so listen for one
+            msg = @pool.reserve(timeout)    # listen for a message; timeout if there is no message within the given timeout period.
+            if msg
+              msg.delete                    # remove the message from the queue
+              
+              notification_task = msg.ybody
+              
+              @result = notification_task.download_result
+            end
+          end
+        
+        # rescue Beanstalk::TimedOut => e
+        #   retry
+        ensure
+          @pool.ignore(tube_name)       # stop watching the queue
+        end
+      elsif result_uri.nil?     # we're not setup to listen to a queue for task-completion, so poll for a result if we don't already have one
+        if timeout              # we need to poll for a result for timeout seconds
+          timeout.to_i.times do
+            sleep(1)            # sleep for one second
+            poll_for_result     # poll for a result
+            break if @result    # break out if we finally have a result
+          end
+        else
+          loop do
+            sleep(1)            # sleep for one second
+            poll_for_result     # poll for a result
+            break if @result    # break out if we finally have a result
+          end
+        end
+      end
+      
+      @result
     end
     
-    def value(timeout = nil)
-      result_reference.value(timeout)
+    def poll_for_result
+      # reload the task's result_uri from "global" redis
+      reload!(:result_uri)
+
+      # download the task's result if the task's result_uri field is set
+      download_result
+    end
+    
+    # download the task's result if the task's result_uri field is set
+    # This method returns the downloaded result, or nil if result_uri isn't set.
+    # The downloaded result is also assigned to this task's @result instance variable.
+    def download_result
+      return @result if @result
+
+      if result_uri
+        uri = LegacyExtendedIRI.new(result_uri)       # uri will be something like this: "redis://127.0.0.1:6379/0/12345"
+        db, result_id = uri.path.split('/').drop(1)
+      
+        redis = Redis.new(:host => uri.host || "127.0.0.1", :port => uri.port || 6379, :db => db || 0)
+        @result = redis.get(result_id)
+        redis.quit
+        
+        @result
+      end
     end
   end
   
@@ -121,17 +186,45 @@ module Colony
   class Job < Ohm::Model
     include Message
     
+    attribute :task_count
+    attribute :status
+    counter :completed_task_count
     collection :tasks, JobTask
     
     def initialize(attrs = {})
       super(attrs.merge(type: Message::JOB))
+    end
+    
+    def task(fn_name, args_array, notify_on_complete = false, callback_fn = nil)
+      task = JobTask.create(status: States::NEW, 
+                            fn: fn_name, 
+                            args: args_array, 
+                            callback: callback_fn, 
+                            notify: notify_on_complete,
+                            job: self)
+      task.pool = self.pool
+      message_id = task.enqueue(Tubes::NEW_TASK)
+      
+      # if the response was a numeric job id, then the task was successfully enqueued
+      if message_id.is_a? Numeric
+        task.status = States::QUEUED
+      else
+        # try to enqueue the task again
+        if task.enqueue(Tubes::NEW_TASK).is_a? Numeric
+          task.status = States::QUEUED
+        else
+          task.status = States::NOT_QUEUED
+        end
+      end
+      
+      task
     end
   end
   
   class JobTask < Ohm::Model
     include TaskMessage
     
-    attribute :job_id
+    reference :job, Job
     
     def initialize(attrs = {})
       super(attrs.merge(type: Message::JOB_TASK))
@@ -170,78 +263,10 @@ module Colony
       task
     end
     
-    # def job(tasks)
-    # end
-  end
-  
-  # This class is not thread-safe. Only one ResultReference object per Client object
-  # should be used at once. It is safe to call ResultReference#value from different ResultReference objects
-  # in different threads *as long as* they were generated from different Client objects.
-  class ResultReference
-    def initialize(task, mq_pool = nil)
-      @task = task
-      @pool = mq_pool
-    end
-    
-    # download the task's result if the task's result_uri field is set
-    def download_result(task = nil)
-      return @result if @result
-
-      task ||= @task
-      
-      if task.result_uri
-        uri = LegacyExtendedIRI.new(task.result_uri)       # uri will be something like this: "redis://127.0.0.1:6379/0/12345"
-        db, result_id = uri.path.split('/').drop(1)
-      
-        redis = Redis.new(:host => uri.host || "127.0.0.1", :port => uri.port || 6379, :db => db || 0)
-        @result = redis.get(result_id)
-        redis.quit
-        
-        @result
-      end
-    end
-    
-    # The default timeout is "forever", i.e. wait indefinitely.
-    def value(timeout = nil)
-      return @result if @result
-      
-      # reload the task's result_uri from "global" redis
-      @task.reload!(:result_uri)
-      
-      # download the task's result if the task's result_uri field is set
-      download_result
-      
-      # listen for task completion notification if the task is set up to do that
-      if @task.notify && @pool
-        @pool.watch(@task.tube_name)           # subscribe to the task-specific tube
-        
-        begin
-          
-          # if we already have a result_uri, just clear any message off the queue
-          if @task.result_uri
-            if @pool.peek_ready
-              msg = @pool.reserve(0)        # poll the queue for a pre-existing message. Timeout immediately if there is no message.
-              msg.delete if msg             # delete the message, we don't need it
-            end
-          else      # we don't already have a result_uri, so listen for one
-            msg = @pool.reserve(timeout)    # listen for a message; timeout if there is no message within the given timeout period.
-            if msg
-              msg.delete                    # remove the message from the queue
-
-              notification_task = msg.ybody
-            
-              download_result(notification_task)
-            end
-          end
-        
-        # rescue Beanstalk::TimedOut => e
-        #   retry
-        ensure
-          @pool.ignore(@task.tube_name)       # stop watching the queue
-        end
-      end
-      
-      @result
+    def job(notify_on_complete = false, callback_fn = nil)
+      j = Job.create(status: States::NEW, callback: callback_fn, notify: notify_on_complete)
+      j.pool = @pool
+      j
     end
   end
   

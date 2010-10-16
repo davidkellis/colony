@@ -7,12 +7,20 @@ def main
 
   puts '************** POLLING **************'
 
-  result1 = c.task(:multiply, [1, 2, 3])
-  puts "result1 = c.task(:multiply, [1, 2, 3])"
+  result0 = c.task(:multiply, [1, 2, 3])
+  puts "result0 = c.task(:multiply, [1, 2, 3])"
 
   begin
-    val = result1.value
-    puts "result1.value -> #{val}"
+    val = result0.value(0)
+    puts "result0.value(0) -> #{val}"
+  end until val
+
+  result1 = c.task(:delayed_multiply, [1, 2, 3])
+  puts "result1 = c.task(:delayed_multiply, [1, 2, 3])"
+
+  begin
+    val = result1.value(1)
+    puts "result1.value(1) -> #{val}"
   end until val
 
   result2 = c.task(:multiply, [4, 5, 6])
@@ -26,8 +34,8 @@ def main
 
   puts '************** BLOCKING **************'
 
-  result3 = c.task(:multiply, [1, 2, 3], true)
-  puts "result3 = c.task(:multiply, [1, 2, 3], true)"
+  result3 = c.task(:delayed_multiply, [1, 2, 3], true)
+  puts "result3 = c.task(:delayed_multiply, [1, 2, 3], true)"
 
   begin
     val = result3.value
@@ -36,7 +44,7 @@ def main
   
   result4 = c.task(:multiply, [4, 5, 6], true)
   puts "result4 = c.task(:multiply, [4, 5, 6], true)"
-
+  
   begin
     val = result4.value
     puts "c.task(:multiply, [4, 5, 6], true) -> #{val}"
@@ -56,18 +64,15 @@ def main
   result6 = c.task("MyFunctions.sqrt", [25], true, :print_hi_on_worker)
   puts "c.task(\"MyFunctions.sqrt\", [25], true, :print_hi_on_worker) -> #{result5.value}"
 
-
-  # j = c.job
-  # rand_numbers = 100.times.map { rand(100) }
-  # slices = rand_numbers.each_slice(3)
+  
+  # puts '************** Job with 3 subtasks **************'
+  # 
+  # j = c.job(callback: :join_and_print)
+  # rand_numbers = 100.times.map { rand(100) }      # [99, 57, 61, 75, 39, 35, 20, 8, 34, 91, ...]
+  # slices = rand_numbers.each_slice(3)             # [[99, 57, 61], [75, 39, 35], [20, 8, 34], [91, 0, 36], ...]
   # results = slices.map {|slice| j.task(:multiply, slice) }
   # 
   # puts slices.zip(results.map(&:value)).map{|pair| pair.join(" -> ")}.join("\n")
-  # 
-  # j = c.job
-  # j.callback(:join_and_print)
-  # results = slices.map {|slice| j.task(:multiply, slice) }
-
 end
 
 main

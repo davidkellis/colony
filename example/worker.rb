@@ -13,12 +13,17 @@ def multiply(a, b, c)
   a * b * c
 end
 
+def delayed_multiply(a, b, c)
+  sleep(2)
+  a * b * c
+end
+
 def print_hi_on_worker(task_id, result_uri)
   puts "Hi, from the callback for task \"#{task_id}\", who's return value is located at:\n#{result_uri}"
 end
 
-def pp_task_info(task)
-  pp task
+def join_and_print(job_id, result_uris)
+  puts "Hi, from the callback for job \"#{job_id}\", who's return values are located at:\n#{result_uris}"
 end
 
 def main
