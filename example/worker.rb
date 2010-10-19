@@ -9,21 +9,21 @@ module MyFunctions
   end
 end
 
-def multiply(a, b, c)
-  a * b * c
+def multiply(*args)
+  args.reduce(:*)
 end
 
-def delayed_multiply(a, b, c)
+def delayed_multiply(*args)
   sleep(2)
-  a * b * c
+  args.reduce(:*)
 end
 
 def print_hi_on_worker(task_id, result_uri)
   puts "Hi, from the callback for task \"#{task_id}\", who's return value is located at:\n#{result_uri}"
 end
 
-def join_and_print(job_id, result_uris)
-  puts "Hi, from the callback for job \"#{job_id}\", who's return values are located at:\n#{result_uris}"
+def print_job_info(job_id, task_id_result_uri_pairs)
+  puts "Hi, from the callback for job \"#{job_id}\", who's return values are located at:\n#{task_id_result_uri_pairs}"
 end
 
 def main

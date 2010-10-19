@@ -1,3 +1,4 @@
+require 'pp'
 require 'redis'
 require 'ohm'
 require 'beanstalk-client'
@@ -45,20 +46,13 @@ module Colony
       end
     end
 
-    # TODO: keep this, or use the default id generation?
     def initialize_id
       @id ||= UUIDTools::UUID.random_create.to_s
     end
     
-    def enqueue(tube, bs_pool = nil)
-      @pool = bs_pool if bs_pool
-      
+    def enqueue(tube)
       @pool.use(tube)
       @pool.yput(self)
-    end
-    
-    def to_hash
-      super.merge(type: type)
     end
     
     def full_id
@@ -73,8 +67,6 @@ module Colony
   module TaskMessage
     def self.included(mod)
       mod.module_eval do
-        include Message
-        
         attribute :fn
         attribute :args
         attribute :callback
@@ -84,15 +76,23 @@ module Colony
       end
     end
     
-    def enqueue_callback(tube)
-      callback_task = SimpleTask.create(fn: self.callback, args: [self.full_id, self.result_uri])
-      callback_task.pool = @pool
-      message_id = callback_task.enqueue(tube)
+    def enqueue(tube = Tubes::NEW_TASK)
+      super(tube)
+    end
+    
+    def enqueue_callback(tube = Tubes::NEW_TASK)
+      if callback
+        callback_task = SimpleTask.create(fn: self.callback, args: [self.full_id, self.result_uri])
+        callback_task.pool = @pool
+        message_id = callback_task.enqueue(tube)
+      end
     end
     
     def enqueue_notification
-      @pool.use(self.tube_name)
-      @pool.yput(self)
+      if notify
+        @pool.use(self.tube_name)
+        @pool.yput(self)
+      end
     end
     
     # The default timeout is "forever", i.e. wait indefinitely.
@@ -176,6 +176,7 @@ module Colony
   end
   
   class SimpleTask < Ohm::Model
+    include Message
     include TaskMessage
     
     def initialize(attrs = {})
@@ -183,16 +184,82 @@ module Colony
     end
   end
   
+  class JobReference
+    attr_accessor :id, :status
+    
+    def initialize(job)
+      self.id = job.id
+      self.status = job.status
+    end
+  end
+  
   class Job < Ohm::Model
     include Message
     
-    attribute :task_count
     attribute :status
+    attribute :callback
+    attribute :notify
+    attribute :task_count
+    
     counter :completed_task_count
-    collection :tasks, JobTask
+    # collection :tasks, JobTask            # this might be the wrong way of doing this, as I don't think it's memoized.
     
     def initialize(attrs = {})
       super(attrs.merge(type: Message::JOB))
+    end
+    
+    def tasks(reload = false)
+      if reload
+        @tasks = find_tasks.to_a
+      else
+        @tasks ||= find_tasks.to_a
+      end
+    end
+    
+    def find_tasks
+      JobTask.find(:job_id => self.id)
+    end
+    
+    # do the job-completion tasks if the job's subtasks are all complete
+    def increment_completed_task_count
+      new_completed_count = self.incr(:completed_task_count)
+      
+      # the job is complete if the completed_task_count == the total task count
+      if new_completed_count == task_count
+        mark_complete!
+        enqueue_callback
+        enqueue_notification
+      end
+    end
+    
+    def mark_complete!
+      update(status: States::COMPLETE)      # mark the job as complete
+    end
+    
+    # call when all the job's tasks are complete
+    def enqueue_callback(tube = Tubes::NEW_TASK)
+      if callback
+        callback_task = SimpleTask.create(fn: callback, args: [full_id, task_id_and_result_uri_pairs])
+        callback_task.pool = @pool
+        message_id = callback_task.enqueue(tube)
+      end
+    end
+    
+    def task_id_and_result_uri_pairs
+      tasks.map {|t| [t.full_id, t.result_uri] }
+    end
+    
+    def enqueue_notification
+      if notify
+        notification = JobReference.new(self)
+        @pool.use(self.tube_name)
+        @pool.yput(notification)
+      end
+    end
+    
+    def complete?(reload = true)
+      reload!(:status) if reload
+      (status == States::COMPLETE)
     end
     
     def task(fn_name, args_array, notify_on_complete = false, callback_fn = nil)
@@ -202,26 +269,95 @@ module Colony
                             callback: callback_fn, 
                             notify: notify_on_complete,
                             job: self)
-      task.pool = self.pool
-      message_id = task.enqueue(Tubes::NEW_TASK)
+      tasks << task
+      task
+    end
+    
+    # add all the tasks to the new_task queue
+    def enqueue_tasks
+      update(task_count: tasks.size)       # finalize the task count
       
-      # if the response was a numeric job id, then the task was successfully enqueued
-      if message_id.is_a? Numeric
-        task.status = States::QUEUED
-      else
-        # try to enqueue the task again
-        if task.enqueue(Tubes::NEW_TASK).is_a? Numeric
+      # iterate over all tasks and enqueue each one
+      tasks.each do |task|
+        task.pool = self.pool
+        
+        # puts 'enqueuing'
+        pp task
+        message_id = task.enqueue
+        
+        # if the response was a numeric job id, then the task was successfully enqueued
+        if message_id.is_a? Numeric
           task.status = States::QUEUED
         else
-          task.status = States::NOT_QUEUED
+          # try to enqueue the task again
+          if task.enqueue.is_a? Numeric
+            task.status = States::QUEUED
+          else
+            task.status = States::NOT_QUEUED
+          end
         end
       end
       
-      task
+      tasks.to_a
+    end
+    
+    # This method blocks until the job is complete
+    # If the notify flag is set, it waits for a notification message on the message queue
+    # otherwise, it polls redis to see if the job is complete.
+    def join(timeout = nil)
+      return true if complete?(false)
+      
+      is_complete = complete?
+      
+      # listen for task completion notification if the task is set up to do that
+      if notify && @pool
+        @pool.watch(tube_name)           # subscribe to the task-specific tube
+        
+        begin
+          
+          # if the job is already marked complete, just clear any message off the queue
+          if is_complete
+            if @pool.peek_ready
+              msg = @pool.reserve(0)        # poll the queue for a pre-existing message. Timeout immediately if there is no message.
+              msg.delete if msg             # delete the message, we don't need it
+            end
+          else      # the job isn't yet marked as complete, so listen for a "this job is complete" notification message
+            msg = @pool.reserve(timeout)    # listen for a message; timeout if there is no message within the given timeout period.
+            if msg
+              msg.delete                    # remove the message from the queue
+              
+              jobreference = msg.ybody      # the message is a JobReference object
+              
+              # update the current job's (self's) status attribute with the notification job's status
+              self.status = jobreference.status
+            end
+          end
+        
+        # rescue Beanstalk::TimedOut => e
+        #   retry
+        ensure
+          @pool.ignore(tube_name)       # stop watching the queue
+        end
+      elsif !is_complete    # we're not setup to listen to a queue for task-completion, so poll for job completion if the job isn't marked complete
+        if timeout                # we need to poll for a result for timeout seconds
+          timeout.to_i.times do
+            sleep(1)              # sleep for one second
+            break if complete?    # poll for completion, break out if we finally have a result
+          end
+        else
+          loop do
+            sleep(1)              # sleep for one second
+            break if complete?    # poll for completion, break out if we finally have a result
+          end
+        end
+      end
+      
+      complete?(false)            # return the local (cached) completion status
     end
   end
   
   class JobTask < Ohm::Model
+    include Message
     include TaskMessage
     
     reference :job, Job
@@ -246,14 +382,14 @@ module Colony
                                callback: callback_fn, 
                                notify: notify_on_complete)
       task.pool = @pool
-      message_id = task.enqueue(Tubes::NEW_TASK)
+      message_id = task.enqueue
       
       # if the response was a numeric job id, then the task was successfully enqueued
       if message_id.is_a? Numeric
         task.status = States::QUEUED
       else
         # try to enqueue the task again
-        if task.enqueue(Tubes::NEW_TASK).is_a? Numeric
+        if task.enqueue.is_a? Numeric
           task.status = States::QUEUED
         else
           task.status = States::NOT_QUEUED
@@ -291,19 +427,22 @@ module Colony
         
         task.update(status: States::RUNNING)
         
+        pp task
+        
         result = invoke(task)
         
         result_uri = store_result(result)
         
+        # update the task's attributes
         task.update(result_uri: result_uri, status: States::COMPLETE)
-        
-        if task.callback
-          task.enqueue_callback(Tubes::NEW_TASK)
+        if task.is_a? JobTask
+          j = task.job
+          j.pool = @pool
+          j.increment_completed_task_count
         end
         
-        if task.notify
-          task.enqueue_notification
-        end
+        task.enqueue_callback
+        task.enqueue_notification
         
         job.delete    # mark the job as complete
       end
