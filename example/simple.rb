@@ -65,18 +65,18 @@ def main
   puts "c.task(\"MyFunctions.sqrt\", [25], true, :print_hi_on_worker) -> #{result6.value}"
 
   
-  puts '************** Job with subtasks **************'
-  
-  j = c.job(false, :print_job_info)
-  rand_numbers = 100.times.map { rand(100) }      # [99, 57, 61, 75, 39, 35, 20, 8, 34, 91, ...]
-  slices = rand_numbers.each_slice(3)             # [[99, 57, 61], [75, 39, 35], [20, 8, 34], [91, 0, 36], ...]
-  
-  # there should be 34 slices, and therefore 34 tasks
-  tasks = slices.map {|slice| j.task(:multiply, slice) }
-  
-  j.enqueue_tasks
-  j.join
-  puts slices.zip(tasks.map(&:value)).map {|pair| "#{pair[0].join(' * ')} -> #{pair[1]}"}.join("\n")
+  # puts '************** Job with subtasks **************'
+  # 
+  # j = c.job(false, :print_job_info)
+  # rand_numbers = 100.times.map { rand(100) }      # [99, 57, 61, 75, 39, 35, 20, 8, 34, 91, ...]
+  # slices = rand_numbers.each_slice(3)             # [[99, 57, 61], [75, 39, 35], [20, 8, 34], [91, 0, 36], ...]
+  # 
+  # # there should be 34 slices, and therefore 34 tasks
+  # tasks = slices.map {|slice| j.task(:multiply, slice) }
+  # 
+  # j.enqueue_tasks
+  # j.join
+  # puts slices.zip(tasks.map(&:value)).map {|pair| "#{pair[0].join(' * ')} -> #{pair[1]}"}.join("\n")
 end
 
 main

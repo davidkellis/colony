@@ -1,8 +1,8 @@
 require 'pp'
 require 'redis'
-require 'ohm'
 require 'beanstalk-client'
 require 'leiri'
+require 'redismodel'
 require 'uuidtools'
 
 TOPLEVEL = self
@@ -31,48 +31,45 @@ module Colony
     SIMPLE_TASK = :task
     JOB_TASK = :jobtask
     JOB = :job
-
+    
     STATUS_QUERY = :statusq
     STATUS = :status
     INFO = :info
     RESULT = :result
     
     def self.included(mod)
-      mod.module_eval do
-        attribute :type
+      mod.class_eval do
+        field :type
         
         # the pool attribute is an instance of Beanstalk::Pool
         attr_accessor :pool
+        attr_writer :id
       end
-    end
-
-    def initialize_id
-      @id ||= UUIDTools::UUID.random_create.to_s
     end
     
     def enqueue(tube)
-      @pool.use(tube)
-      @pool.yput(self)
+      pool.use(tube)
+      pool.yput(self)
     end
     
     def full_id
-      key
+      key_prefix      # a string like this: "TaskMessage:e9601b8e-79cd-4d48-b6ba-81acc5592bea"
     end
     
     def tube_name
-      key.gsub(":", "-")
+      key_prefix.gsub(':','-')    # # a string like this: "TaskMessage-e9601b8e-79cd-4d48-b6ba-81acc5592bea"
     end
   end
   
   module TaskMessage
     def self.included(mod)
-      mod.module_eval do
-        attribute :fn
-        attribute :args
-        attribute :callback
-        attribute :result_uri
-        attribute :notify
-        attribute :status
+      mod.class_eval do
+        field :fn
+        field :args
+        field :callback
+        field :result_uri
+        field :notify
+        field :status
       end
     end
     
@@ -82,16 +79,15 @@ module Colony
     
     def enqueue_callback(tube = Tubes::NEW_TASK)
       if callback
-        callback_task = SimpleTask.create(fn: self.callback, args: [self.full_id, self.result_uri])
-        callback_task.pool = @pool
+        callback_task = SimpleTask.create(redis, fn: self.callback, args: [self.full_id, self.result_uri], pool: pool)
         message_id = callback_task.enqueue(tube)
       end
     end
     
     def enqueue_notification
       if notify
-        @pool.use(self.tube_name)
-        @pool.yput(self)
+        pool.use(tube_name)
+        pool.yput(self)
       end
     end
     
@@ -102,19 +98,19 @@ module Colony
       poll_for_result
       
       # listen for task completion notification if the task is set up to do that
-      if notify && @pool
-        @pool.watch(tube_name)           # subscribe to the task-specific tube
+      if notify && pool
+        pool.watch(tube_name)           # subscribe to the task-specific tube
         
         begin
           
           # if we already have a result_uri, just clear any message off the queue
           if result_uri
-            if @pool.peek_ready
-              msg = @pool.reserve(0)        # poll the queue for a pre-existing message. Timeout immediately if there is no message.
+            if pool.peek_ready
+              msg = pool.reserve(0)        # poll the queue for a pre-existing message. Timeout immediately if there is no message.
               msg.delete if msg             # delete the message, we don't need it
             end
           else      # we don't already have a result_uri, so listen for one
-            msg = @pool.reserve(timeout)    # listen for a message; timeout if there is no message within the given timeout period.
+            msg = pool.reserve(timeout)    # listen for a message; timeout if there is no message within the given timeout period.
             if msg
               msg.delete                    # remove the message from the queue
               
@@ -127,7 +123,7 @@ module Colony
         # rescue Beanstalk::TimedOut => e
         #   retry
         ensure
-          @pool.ignore(tube_name)       # stop watching the queue
+          pool.ignore(tube_name)       # stop watching the queue
         end
       elsif result_uri.nil?     # we're not setup to listen to a queue for task-completion, so poll for a result if we don't already have one
         if timeout              # we need to poll for a result for timeout seconds
@@ -150,7 +146,7 @@ module Colony
     
     def poll_for_result
       # reload the task's result_uri from "global" redis
-      reload!(:result_uri)
+      reload!([:result_uri])
 
       # download the task's result if the task's result_uri field is set
       download_result
@@ -175,7 +171,8 @@ module Colony
     end
   end
   
-  class SimpleTask < Ohm::Model
+  class SimpleTask
+    include RedisModel
     include Message
     include TaskMessage
     
@@ -184,6 +181,22 @@ module Colony
     end
   end
   
+  class JobTask
+    include RedisModel
+    include Message
+    include TaskMessage
+    
+    field :job_id
+    
+    def initialize(attrs = {})
+      super(attrs.merge(type: Message::JOB_TASK))
+    end
+    
+    def job
+      @job ||= Job.new()
+    end
+  end
+
   class JobReference
     attr_accessor :id, :status
     
@@ -193,16 +206,15 @@ module Colony
     end
   end
   
-  class Job < Ohm::Model
+  class Job
+    include RedisModel
     include Message
     
-    attribute :status
-    attribute :callback
-    attribute :notify
-    attribute :task_count
-    
-    counter :completed_task_count
-    # collection :tasks, JobTask            # this might be the wrong way of doing this, as I don't think it's memoized.
+    field :status
+    field :callback
+    field :notify
+    field :task_count
+    field :completed_task_count
     
     def initialize(attrs = {})
       super(attrs.merge(type: Message::JOB))
@@ -239,7 +251,7 @@ module Colony
     # call when all the job's tasks are complete
     def enqueue_callback(tube = Tubes::NEW_TASK)
       if callback
-        callback_task = SimpleTask.create(fn: callback, args: [full_id, task_id_and_result_uri_pairs])
+        callback_task = SimpleTask.create(redis, fn: callback, args: [full_id, task_id_and_result_uri_pairs])
         callback_task.pool = @pool
         message_id = callback_task.enqueue(tube)
       end
@@ -252,8 +264,8 @@ module Colony
     def enqueue_notification
       if notify
         notification = JobReference.new(self)
-        @pool.use(self.tube_name)
-        @pool.yput(notification)
+        pool.use(self.tube_name)
+        pool.yput(notification)
       end
     end
     
@@ -263,7 +275,8 @@ module Colony
     end
     
     def task(fn_name, args_array, notify_on_complete = false, callback_fn = nil)
-      task = JobTask.create(status: States::NEW, 
+      task = JobTask.create(redis,
+                            status: States::NEW, 
                             fn: fn_name, 
                             args: args_array, 
                             callback: callback_fn, 
@@ -310,19 +323,19 @@ module Colony
       is_complete = complete?
       
       # listen for task completion notification if the task is set up to do that
-      if notify && @pool
-        @pool.watch(tube_name)           # subscribe to the task-specific tube
+      if notify && pool
+        pool.watch(tube_name)           # subscribe to the task-specific tube
         
         begin
           
           # if the job is already marked complete, just clear any message off the queue
           if is_complete
-            if @pool.peek_ready
-              msg = @pool.reserve(0)        # poll the queue for a pre-existing message. Timeout immediately if there is no message.
+            if pool.peek_ready
+              msg = pool.reserve(0)        # poll the queue for a pre-existing message. Timeout immediately if there is no message.
               msg.delete if msg             # delete the message, we don't need it
             end
           else      # the job isn't yet marked as complete, so listen for a "this job is complete" notification message
-            msg = @pool.reserve(timeout)    # listen for a message; timeout if there is no message within the given timeout period.
+            msg = pool.reserve(timeout)    # listen for a message; timeout if there is no message within the given timeout period.
             if msg
               msg.delete                    # remove the message from the queue
               
@@ -336,7 +349,7 @@ module Colony
         # rescue Beanstalk::TimedOut => e
         #   retry
         ensure
-          @pool.ignore(tube_name)       # stop watching the queue
+          pool.ignore(tube_name)       # stop watching the queue
         end
       elsif !is_complete    # we're not setup to listen to a queue for task-completion, so poll for job completion if the job isn't marked complete
         if timeout                # we need to poll for a result for timeout seconds
@@ -356,27 +369,17 @@ module Colony
     end
   end
   
-  class JobTask < Ohm::Model
-    include Message
-    include TaskMessage
-    
-    reference :job, Job
-    
-    def initialize(attrs = {})
-      super(attrs.merge(type: Message::JOB_TASK))
-    end
-  end
-  
   class Client
     def initialize(queues, global_redis_server = {})
       @pool = Beanstalk::Pool.new(queues)
       # @pool.ignore(TUBE_DEFAULT)
       
-      Ohm.connect(global_redis_server)
+      @redis = Redis.new(global_redis_server)
     end
     
     def task(fn_name, args_array, notify_on_complete = false, callback_fn = nil)
-      task = SimpleTask.create(status: States::NEW, 
+      task = SimpleTask.create(@redis,
+                               status: States::NEW, 
                                fn: fn_name, 
                                args: args_array, 
                                callback: callback_fn, 
@@ -400,7 +403,7 @@ module Colony
     end
     
     def job(notify_on_complete = false, callback_fn = nil)
-      j = Job.create(status: States::NEW, callback: callback_fn, notify: notify_on_complete)
+      j = Job.create(redis, status: States::NEW, callback: callback_fn, notify: notify_on_complete)
       j.pool = @pool
       j
     end
@@ -412,8 +415,7 @@ module Colony
       # @pool.ignore(TUBE_DEFAULT)
       @pool.watch(Tubes::NEW_TASK)
       
-      Ohm.connect(global_redis_server)
-      
+      @global_redis_server = Redis.new(global_redis_server)
       @local_redis_server = Redis.new(local_redis_server)
     end
     
@@ -424,8 +426,9 @@ module Colony
         task = job.ybody
         
         task.pool = @pool
+        task.redis = @global_redis_server
         
-        task.update(status: States::RUNNING)
+        task.update!(status: States::RUNNING)
         
         pp task
         
@@ -434,7 +437,7 @@ module Colony
         result_uri = store_result(result)
         
         # update the task's attributes
-        task.update(result_uri: result_uri, status: States::COMPLETE)
+        task.update!(result_uri: result_uri, status: States::COMPLETE)
         if task.is_a? JobTask
           j = task.job
           j.pool = @pool
