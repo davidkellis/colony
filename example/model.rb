@@ -38,14 +38,16 @@ def main
   p = Person.create(r, name: "David")
   pp p
   
-  c = Address.create(r, name: "David Ellis", person: p)
+  c = Address.create(r, name: "Ellis1", person: p)
+  c2 = Address.create(r, name: "Ellis2", person: p)
   pp c
   
   d = Address.load(r, c.id)
-  pp d
-  
+  pp d  
   puts "p.id == c.person.id => #{p.id == c.person.id}"
   puts "p.id == d.person.id => #{p.id == d.person.id}"
+  
+  pp p.addresses
 end
 
 main

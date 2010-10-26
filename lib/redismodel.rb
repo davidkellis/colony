@@ -13,17 +13,6 @@ module RedisModel
     def field(name)
       fields << name
       
-      # define accessor methods
-      # self.module_eval(<<-METHOD)
-      #   def #{name}()
-      #     @#{name}
-      #   end
-      #   
-      #   def #{name}=(value)
-      #     @#{name} = value
-      #   end
-      # METHOD
-      
       self.module_eval do
         attr_accessor name.to_sym
       end
@@ -260,7 +249,7 @@ module RedisModel
   
   def unmarshal_attributes_hash(hash)
     # perform any necessary unmarshalling
-    hash.merge(merge) do |attribute, value|
+    hash.merge(hash) do |attribute, value|
       unmarshal(attribute, value)
     end
   end
