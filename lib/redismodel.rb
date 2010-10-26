@@ -38,15 +38,77 @@ module RedisModel
       @fields ||= [:id]
     end
     
+    # This method will read a redis set with a key-name of "<this model class name>:id:relation".
+    # The members of the set are the ids of the model objects that belong to this model object, on the specified has_many relation.
+    # Example:
+    #   has_many :tasks, JobTask
+    def has_many(relation_name, other_model_class_name)
+      
+      has_many_relations << relation_name
+      
+      # define finder method and getter method
+      self.module_eval(<<-METHOD)
+        def find_#{relation_name}()
+          ids = ids_for_has_many_relation(#{relation_name})
+          ids.map {|id| #{other_model_class_name}.load(redis, id) }
+        end
+        
+        def #{relation_name}(reload = false)
+          if reload
+            @#{relation_name} = find_#{relation_name}()
+          else
+            @#{relation_name} ||= find_#{relation_name}()
+          end
+        end
+      METHOD
+    end
+    
+    def has_many_relations
+      @has_many_relations ||= []
+    end
+    
+    # Example:
+    #   belongs_to :job, Job, :tasks
+    def belongs_to(relation_name, other_model_class_name, reverse_relation)
+      
+      belongs_to_relations << [relation_name, other_model_class_name, reverse_relation]
+      
+      # define field for the <relation>_id
+      # define getter/setter for related model object
+      self.module_eval(<<-METHOD)
+        field :#{relation_name}_id        # creates ..._id getter/setter and registers ..._id as a field
+        
+        def #{relation_name}
+          return @#{relation_name} if @#{relation_name} && @#{relation_name}.id == #{relation_name}_id
+          @#{relation_name} = #{other_model_class_name}.load(redis, #{relation_name}_id)
+        end
+        
+        def #{relation_name}=(model_obj)
+          unregister_from_has_many_relation_on("#{other_model_class_name}", self.#{relation_name}_id, "#{reverse_relation}")
+          
+          @#{relation_name} = model_obj
+          self.#{relation_name}_id = model_obj.id
+          save!([:#{relation_name}_id])
+          @#{relation_name}
+        end
+      METHOD
+    end
+    
+    def belongs_to_relations
+      @belongs_to_relations ||= []
+    end
+    
     def create(redis, attrs = {})
-      m = self.new(attrs)
-      m.redis = redis
-      m.save!(attrs.keys)
+      m = self.new(attrs) { |obj| obj.redis = redis }
+      keys_to_save = attrs.keys
+      # if the id attribute isn't passed in on the attrs hash, then we want to add it to the list of attributes to save to redis
+      keys_to_save << :id unless attrs.keys.include?(:id)
+      m.save!(keys_to_save)
       m
     end
     
     def load(redis, id, attrs = [])
-      m = self.new(id: id)
+      m = self.new(id: id) { |obj| obj.redis = redis }
       m.redis = redis
       attrs = fields if attrs.count == 0
       m.reload!(attrs)
@@ -63,6 +125,7 @@ module RedisModel
   end
   
   def initialize(attrs = {})
+    yield(self) if block_given?
     do_assignments_to_self(attrs)
   end
   
@@ -113,6 +176,20 @@ module RedisModel
     "#{key_prefix}:#{attribute.to_s}"
   end
   
+  def key_for_has_many_relation_on_other_model(model_class_name, model_object_id, reverse_relation_name)
+    "#{model_class_name}:#{model_object_id}:#{reverse_relation_name}"
+  end
+  
+  # returns a key (string) of the form: <this model class name>:id:relation
+  def key_for_has_many_relation(relation)
+    "#{key_prefix}:#{relation}"
+  end
+  
+  # returns an array consisting of the ids of the model objects that belong_to this model object
+  def ids_for_has_many_relation(relation)
+    redis.smembers(key_for_has_many_relation(relation))
+  end
+  
   def get_local_attribute(attribute)
     if respond_to? attribute
       send(attribute.to_sym)
@@ -139,9 +216,9 @@ module RedisModel
   end
   
   def set_remote_attribute(attribute, value)
-    if self.class.fields.include?(attribute)     # if the attribute is a field, then we want to call redis.hset
+    if self.class.fields.include?(attribute)      # if the attribute is a field, then we want to call redis.hset
       redis.hset(key_prefix, attribute, value)
-    else                                    # otherwise, we want to call redis.set
+    else                                          # otherwise, we want to call redis.set
       redis.set(key_for(attribute), value)
     end
   end
@@ -156,7 +233,7 @@ module RedisModel
   
   def reload!(attrs = [])
     # do_assignments_to_self(Array.hashify(attrs) {|attribute| get_remote_attribute(attribute)})
-    do_assignments_to_self(get_remote_attributes(attrs))
+    do_assignments_to_self(unmarshal_attributes_hash(get_remote_attributes(attrs)))
   end
   
   def reload_all!
@@ -172,9 +249,52 @@ module RedisModel
     end
   end
   
+  def unmarshal(attribute, value)
+    method = "unmarshal_#{attribute}".to_sym
+    if respond_to? method
+      send(method)
+    else
+      value
+    end
+  end
+  
+  def unmarshal_attributes_hash(hash)
+    # perform any necessary unmarshalling
+    hash.merge(merge) do |attribute, value|
+      unmarshal(attribute, value)
+    end
+  end
+  
+  # add this model object's id to the redis set
+  # with a key-name of "<relation model class name>:id:relation"
+  def register_in_has_many_relation_on(local_relation_name, other_model_class_name, other_model_has_many_relation)
+    # redis.sadd(other_model_object.key_for_has_many_relation(other_model_has_many_relation), self.id)
+    model_id = self.send("#{local_relation_name}_id".to_sym)
+    if(model_id)
+      redis.sadd(key_for_has_many_relation_on_other_model(other_model_class_name, model_id, other_model_has_many_relation), self.id)
+    end
+  end
+
+  def unregister_from_has_many_relation_on(other_model_class_name, model_id, other_model_has_many_relation)
+    if(model_id)
+      redis.srem(key_for_has_many_relation_on_other_model(other_model_class_name, model_id, other_model_has_many_relation), self.id)
+    end
+  end
+  
   def save!(attrs = [])
     attrs.each do |attribute|
       set_remote_attribute(attribute, marshal(attribute))
+    end
+    
+    # iterate over all belongs_to relations and add this model object's id to the redis set
+    # with a key-name of "<relation model class name>:id:relation"
+    self.class.belongs_to_relations.each do |relation_3_tuple|
+      # each tuple is o the form: [relation_name, other_model_class_name, reverse_relation]
+      local_relation_name = relation_3_tuple[0]
+      reverse_relation_class_name = relation_3_tuple[1]   # second item in the tuple is the class name of the model which has the has_many relation with this model class
+      reverse_relation_name = relation_3_tuple[2]         # the third item in the tuple is the relation name on the other model
+      
+      register_in_has_many_relation_on(local_relation_name, reverse_relation_class_name, reverse_relation_name)
     end
   end
   

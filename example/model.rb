@@ -15,6 +15,14 @@ class Address
   field :zip
   
   field :years_at_address
+  
+  belongs_to :person, 'Person', :addresses
+end
+
+class Person
+  include RedisModel
+  
+  has_many :addresses, 'Address'
 end
 
 def main
@@ -26,6 +34,18 @@ def main
   
   b = Address.load(r, a.id)
   pp b
+  
+  p = Person.create(r, name: "David")
+  pp p
+  
+  c = Address.create(r, name: "David Ellis", person: p)
+  pp c
+  
+  d = Address.load(r, c.id)
+  pp d
+  
+  puts "p.id == c.person.id => #{p.id == c.person.id}"
+  puts "p.id == d.person.id => #{p.id == d.person.id}"
 end
 
 main

@@ -43,7 +43,6 @@ module Colony
         
         # the pool attribute is an instance of Beanstalk::Pool
         attr_accessor :pool
-        attr_writer :id
       end
     end
     
@@ -186,17 +185,25 @@ module Colony
     include Message
     include TaskMessage
     
-    field :job_id
+    belongs_to :job, Job
     
     def initialize(attrs = {})
       super(attrs.merge(type: Message::JOB_TASK))
     end
     
-    def job
-      @job ||= Job.new()
-    end
+    # def job=(job_object)
+    #   @job = job_object
+    #   self.job_id = job_object.id
+    #   save!([:job_id])
+    # end
+    # 
+    # def job
+    #   return @job if @job
+    #   
+    #   @job = Job.load(redis, job_id)
+    # end
   end
-
+  
   class JobReference
     attr_accessor :id, :status
     
@@ -216,15 +223,17 @@ module Colony
     field :task_count
     field :completed_task_count
     
+    has_many :tasks, JobTask
+    
     def initialize(attrs = {})
       super(attrs.merge(type: Message::JOB))
     end
     
     def tasks(reload = false)
       if reload
-        @tasks = find_tasks.to_a
+        @tasks = find_tasks
       else
-        @tasks ||= find_tasks.to_a
+        @tasks ||= find_tasks
       end
     end
     
@@ -234,7 +243,7 @@ module Colony
     
     # do the job-completion tasks if the job's subtasks are all complete
     def increment_completed_task_count
-      new_completed_count = self.incr(:completed_task_count)
+      new_completed_count = increment(:completed_task_count)
       
       # the job is complete if the completed_task_count == the total task count
       if new_completed_count == task_count
@@ -245,7 +254,7 @@ module Colony
     end
     
     def mark_complete!
-      update(status: States::COMPLETE)      # mark the job as complete
+      update!(status: States::COMPLETE)      # mark the job as complete
     end
     
     # call when all the job's tasks are complete
@@ -288,7 +297,7 @@ module Colony
     
     # add all the tasks to the new_task queue
     def enqueue_tasks
-      update(task_count: tasks.size)       # finalize the task count
+      update!(task_count: tasks.size)       # finalize the task count
       
       # iterate over all tasks and enqueue each one
       tasks.each do |task|
@@ -403,7 +412,7 @@ module Colony
     end
     
     def job(notify_on_complete = false, callback_fn = nil)
-      j = Job.create(redis, status: States::NEW, callback: callback_fn, notify: notify_on_complete)
+      j = Job.create(@redis, status: States::NEW, callback: callback_fn, notify: notify_on_complete)
       j.pool = @pool
       j
     end
