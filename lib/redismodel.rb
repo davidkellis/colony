@@ -1,5 +1,6 @@
 require 'redis'
 require 'uuidtools'
+require 'moduletemplate'
 
 def Array.hashify(arr, &blk)
   arr.reduce(Hash.new) do |memo, item|
@@ -9,6 +10,51 @@ def Array.hashify(arr, &blk)
 end
 
 module RedisModel
+  module ModuleTemplates
+    
+    # params: relation_name, other_model_class_name
+    # define finder method and getter method
+    HasManyFinderAndGetter = ModuleTemplate.new(<<-'MOD')
+      def find_!{relation_name}()
+        ids = ids_for_has_many_relation("!{relation_name}")
+        ids.map {|id| !{other_model_class_name}.load(redis, id) }
+      end
+      
+      def !{relation_name}(reload = false)
+        if reload
+          @!{relation_name} = find_!{relation_name}()
+        else
+          @!{relation_name} ||= find_!{relation_name}()
+        end
+      end
+    MOD
+    
+    # params: relation_name, other_model_class_name, reverse_relation
+    # define field for the <relation>_id
+    # define getter/setter for related model object
+    BelongsToGetterAndSetter = ModuleTemplate.new(<<-'MOD')
+      def self.included(mod)
+        mod.module_eval do
+          field :!{relation_name}_id        # creates ..._id getter/setter and registers ..._id as a field
+        end
+      end
+      
+      def !{relation_name}
+        return @!{relation_name} if @!{relation_name} && @!{relation_name}.id == !{relation_name}_id
+        @!{relation_name} = !{other_model_class_name}.load(redis, !{relation_name}_id)
+      end
+      
+      def !{relation_name}=(model_obj)
+        unregister_from_has_many_relation_on("!{other_model_class_name}", self.!{relation_name}_id, "!{reverse_relation}")
+        
+        @!{relation_name} = model_obj
+        self.!{relation_name}_id = model_obj ? model_obj.id : nil
+        save!([:!{relation_name}_id])
+        @!{relation_name}
+      end
+    MOD
+  end
+  
   module ClassMethods
     def field(name)
       fields << name
@@ -35,21 +81,8 @@ module RedisModel
       
       has_many_relations << relation_name
       
-      # define finder method and getter method
-      self.module_eval(<<-METHOD)
-        def find_#{relation_name}()
-          ids = ids_for_has_many_relation(#{relation_name})
-          ids.map {|id| #{other_model_class_name}.load(redis, id) }
-        end
-        
-        def #{relation_name}(reload = false)
-          if reload
-            @#{relation_name} = find_#{relation_name}()
-          else
-            @#{relation_name} ||= find_#{relation_name}()
-          end
-        end
-      METHOD
+      include ModuleTemplates::HasManyFinderAndGetter.generate(relation_name: relation_name,
+                                                               other_model_class_name: other_model_class_name)
     end
     
     def has_many_relations
@@ -62,25 +95,9 @@ module RedisModel
       
       belongs_to_relations << [relation_name, other_model_class_name, reverse_relation]
       
-      # define field for the <relation>_id
-      # define getter/setter for related model object
-      self.module_eval(<<-METHOD)
-        field :#{relation_name}_id        # creates ..._id getter/setter and registers ..._id as a field
-        
-        def #{relation_name}
-          return @#{relation_name} if @#{relation_name} && @#{relation_name}.id == #{relation_name}_id
-          @#{relation_name} = #{other_model_class_name}.load(redis, #{relation_name}_id)
-        end
-        
-        def #{relation_name}=(model_obj)
-          unregister_from_has_many_relation_on("#{other_model_class_name}", self.#{relation_name}_id, "#{reverse_relation}")
-          
-          @#{relation_name} = model_obj
-          self.#{relation_name}_id = model_obj.id
-          save!([:#{relation_name}_id])
-          @#{relation_name}
-        end
-      METHOD
+      include ModuleTemplates::BelongsToGetterAndSetter.generate(relation_name: relation_name,
+                                                                 other_model_class_name: other_model_class_name,
+                                                                 reverse_relation: reverse_relation)
     end
     
     def belongs_to_relations
@@ -263,7 +280,7 @@ module RedisModel
       redis.sadd(key_for_has_many_relation_on_other_model(other_model_class_name, model_id, other_model_has_many_relation), self.id)
     end
   end
-
+  
   def unregister_from_has_many_relation_on(other_model_class_name, model_id, other_model_has_many_relation)
     if(model_id)
       redis.srem(key_for_has_many_relation_on_other_model(other_model_class_name, model_id, other_model_has_many_relation), self.id)

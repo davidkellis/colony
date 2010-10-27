@@ -185,23 +185,11 @@ module Colony
     include Message
     include TaskMessage
     
-    belongs_to :job, Job
+    belongs_to :job, 'Job', :tasks
     
     def initialize(attrs = {})
       super(attrs.merge(type: Message::JOB_TASK))
     end
-    
-    # def job=(job_object)
-    #   @job = job_object
-    #   self.job_id = job_object.id
-    #   save!([:job_id])
-    # end
-    # 
-    # def job
-    #   return @job if @job
-    #   
-    #   @job = Job.load(redis, job_id)
-    # end
   end
   
   class JobReference
@@ -223,22 +211,10 @@ module Colony
     field :task_count
     field :completed_task_count
     
-    has_many :tasks, JobTask
+    has_many :tasks, 'JobTask'
     
     def initialize(attrs = {})
       super(attrs.merge(type: Message::JOB))
-    end
-    
-    def tasks(reload = false)
-      if reload
-        @tasks = find_tasks
-      else
-        @tasks ||= find_tasks
-      end
-    end
-    
-    def find_tasks
-      JobTask.find(:job_id => self.id)
     end
     
     # do the job-completion tasks if the job's subtasks are all complete
@@ -279,7 +255,7 @@ module Colony
     end
     
     def complete?(reload = true)
-      reload!(:status) if reload
+      reload!([:status]) if reload
       (status == States::COMPLETE)
     end
     
@@ -291,7 +267,6 @@ module Colony
                             callback: callback_fn, 
                             notify: notify_on_complete,
                             job: self)
-      tasks << task
       task
     end
     
@@ -300,7 +275,7 @@ module Colony
       update!(task_count: tasks.size)       # finalize the task count
       
       # iterate over all tasks and enqueue each one
-      tasks.each do |task|
+      tasks(true).each do |task|
         task.pool = self.pool
         
         # puts 'enqueuing'

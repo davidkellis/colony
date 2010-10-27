@@ -41,6 +41,10 @@ def main
   c = Address.create(r, name: "Ellis1", person: p)
   c2 = Address.create(r, name: "Ellis2", person: p)
   pp c
+  pp c2
+  
+  c3 = Address.create(r, name: "Ellis3", person: p)
+  c3.person = nil     # TODO: change this so that a save! is required for the relation to be broken. As is, save! isn't required.
   
   d = Address.load(r, c.id)
   pp d  
