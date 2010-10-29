@@ -21,12 +21,6 @@ sudo port install redis
 redis gem:
 gem install redis
 
-ohm gem:
-git clone http://github.com/davidkellis/ohm
-cd ohm
-gem build ohm.gemspec
-gem install ohm-0.1.0.gem
-
 leiri gem:
 git clone git://github.com/davidkellis/leiriparser.git
 cd leiriparser
