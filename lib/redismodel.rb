@@ -167,11 +167,6 @@ module RedisModel
     do_assignments_to_self(attrs)
   end
   
-  # This method returns the Class object to which the class name, classname, refers.
-  # def resolve_classname_to_class(classname)
-  #   self.send("#{classname}_class".to_sym)
-  # end
-  
   def set_field(field_name, value)
     instance_variable_set("@#{field_name}".to_sym, value)
   end
@@ -193,7 +188,7 @@ module RedisModel
   end
 
   # takes a hash and for each key/value pair, does one of the following:
-  # 1. If <key>= is a defined method, then the following assignment is made
+  # 1. If <key>= is a defined method and <key> is not a field defined for this model, then the following assignment is made
   #    self.<key> = value
   # 2. Otherwise, the instance variable @<key> is set with the given value
   def do_assignments_to_self(attrs = {})
@@ -344,19 +339,19 @@ module RedisModel
     end
   end
   
-  def unmarshal(attribute, value)
+  def unmarshal(attribute, marshalled_value)
     method = "unmarshal_#{attribute}".to_sym
     if respond_to? method
-      send(method, value)
+      send(method, marshalled_value)
     else
-      value
+      marshalled_value
     end
   end
   
   def unmarshal_attributes_hash(hash)
     # perform any necessary unmarshalling
-    hash.merge(hash) do |attribute, value|
-      unmarshal(attribute, value)
+    hash.merge(hash) do |attribute, marshalled_value|
+      unmarshal(attribute, marshalled_value)
     end
   end
   

@@ -1,4 +1,3 @@
-require 'pp'
 require 'redis'
 require 'beanstalk-client'
 require 'leiri'
@@ -30,20 +29,8 @@ module Colony
   # Message classes that include Message must also include RedisModel
   # because Message calls key_prefix, a method defined in RedisModel.
   module Message
-    # Message types
-    SIMPLE_TASK = :task
-    JOB_TASK = :jobtask
-    JOB = :job
-    
-    STATUS_QUERY = :statusq
-    STATUS = :status
-    INFO = :info
-    RESULT = :result
-    
     def self.included(mod)
       mod.class_eval do
-        field :type
-        
         # the pool attribute is an instance of Beanstalk::Pool
         attr_accessor :pool
       end
@@ -70,11 +57,23 @@ module Colony
       mod.class_eval do
         field :fn
         field :args
-        field :callback
-        field :result_uri
-        field :notify
         field :status
+        field :callback
+        field :notify
+        field :result_uri
       end
+    end
+    
+    def marshal_fn
+      YAML.dump(fn)
+    end
+    
+    def marshal_args
+      YAML.dump(args)
+    end
+    
+    def marshal_status
+      YAML.dump(status)
     end
     
     def marshal_callback
@@ -83,6 +82,18 @@ module Colony
     
     def marshal_notify
       YAML.dump(notify)
+    end
+    
+    def unmarshal_fn(stored_value)
+      YAML.load(stored_value)
+    end
+    
+    def unmarshal_args(stored_value)
+      YAML.load(stored_value)
+    end
+    
+    def unmarshal_status(stored_value)
+      YAML.load(stored_value)
     end
     
     def unmarshal_callback(stored_value)
@@ -201,10 +212,6 @@ module Colony
     include RedisModel
     include Message
     include TaskMessage
-    
-    def initialize(attrs = {})
-      super(attrs.merge(type: Message::SIMPLE_TASK))
-    end
   end
   
   class JobTask
@@ -213,10 +220,6 @@ module Colony
     include TaskMessage
     
     belongs_to :job, 'Colony::Job', :tasks
-    
-    def initialize(attrs = {})
-      super(attrs.merge(type: Message::JOB_TASK))
-    end
   end
   
   class JobReference
@@ -240,12 +243,20 @@ module Colony
     
     has_many :tasks, 'Colony::JobTask'
     
+    def marshal_status
+      YAML.dump(status)
+    end
+    
     def marshal_callback
       YAML.dump(callback)
     end
     
     def marshal_notify
       YAML.dump(notify)
+    end
+    
+    def unmarshal_status(stored_value)
+      YAML.load(stored_value)
     end
     
     def unmarshal_callback(stored_value)
@@ -256,8 +267,14 @@ module Colony
       YAML.load(stored_value)
     end
     
-    def initialize(attrs = {})
-      super(attrs.merge(type: Message::JOB))
+    # the "marshalled" version of task_count should simply be a string, so just convert it to an integer
+    def unmarshal_task_count(stored_value)
+      stored_value.to_i
+    end
+
+    # the "marshalled" version of completed_task_count should simply be a string, so just convert it to an integer
+    def unmarshal_completed_task_count(stored_value)
+      stored_value.to_i
     end
     
     # do the job-completion tasks if the job's subtasks are all complete
@@ -270,6 +287,8 @@ module Colony
         enqueue_callback
         enqueue_notification
       end
+      
+      new_completed_count
     end
     
     def mark_complete!
@@ -311,20 +330,24 @@ module Colony
                             notify: notify_on_complete,
                             job: self)
       task.pool = @pool
+      
+      increment_task_count()
+      
       task
+    end
+    
+    def increment_task_count
+      @task_count = (task_count || 0) + 1
     end
     
     # add all the tasks to the new_task queue
     def enqueue_tasks
-      update!(task_count: tasks(true).count)       # finalize the task count
-      puts "task count: #{tasks.count}"
+      update!(task_count: task_count)       # finalize the task count
       
       # iterate over all tasks and enqueue each one
       tasks.each do |task|
         task.pool = self.pool
         
-        puts "enqueuing task #{task.id}"
-        pp task
         message_id = task.enqueue
         
         # if the response was a numeric job id, then the task was successfully enqueued
@@ -472,22 +495,22 @@ module Colony
         
         task.update!(status: States::RUNNING)
         
-        pp task
-        
         result = invoke(task)
         
         result_uri = store_result(result)
         
-        # update the task's attributes
+        # update the task's attributes, then enqueue the task's callback (if it exists) and notification (if it exists)
         task.update!(result_uri: result_uri, status: States::COMPLETE)
+        task.enqueue_callback
+        task.enqueue_notification
+        
+        # increment the job's completed_task_count
+        # if all the job's tasks are complete, enqueue the job's callback (if it exists) and notification (if it exists)
         if task.is_a? JobTask
           j = task.job
           j.pool = @pool
           j.increment_completed_task_count
         end
-        
-        task.enqueue_callback
-        task.enqueue_notification
         
         job.delete    # mark the job as complete
       end
