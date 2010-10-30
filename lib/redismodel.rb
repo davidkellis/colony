@@ -53,6 +53,11 @@ module RedisModel
         end
       end
       
+      # NOTE: this is a hack to get the class object to which the given other_model_class_name parameter points.
+      # def !{other_model_class_name}_class()
+      #   @!{other_model_class_name}_class ||= !{other_model_class_name}
+      # end
+      
       def !{relation_name}_id_last_saved()
         @!{relation_name}_id_last_saved
       end
@@ -61,8 +66,8 @@ module RedisModel
         @!{relation_name}_id_last_saved = value
       end
       
-      def !{relation_name}
-        return @!{relation_name} if @!{relation_name} && @!{relation_name}.id == !{relation_name}_id
+      def !{relation_name}(reload = false)
+        return @!{relation_name} if !reload && @!{relation_name} && @!{relation_name}.id == !{relation_name}_id
         @!{relation_name} = !{relation_name}_id ? !{other_model_class_name}.load(redis, !{relation_name}_id) : nil
       end
       
@@ -95,7 +100,7 @@ module RedisModel
     # This method will read a redis set with a key-name of "<this model class name>:id:relation".
     # The members of the set are the ids of the model objects that belong to this model object, on the specified has_many relation.
     # Example:
-    #   has_many :tasks, JobTask
+    #   has_many :tasks, 'JobTask'
     def has_many(relation_name, other_model_class_name)
       
       has_many_relations << relation_name
@@ -109,7 +114,7 @@ module RedisModel
     end
     
     # Example:
-    #   belongs_to :job, Job, :tasks
+    #   belongs_to :job, 'Job', :tasks
     def belongs_to(relation_name, other_model_class_name, reverse_relation)
       
       belongs_to_relations << [relation_name, other_model_class_name, reverse_relation]
@@ -162,6 +167,11 @@ module RedisModel
     do_assignments_to_self(attrs)
   end
   
+  # This method returns the Class object to which the class name, classname, refers.
+  # def resolve_classname_to_class(classname)
+  #   self.send("#{classname}_class".to_sym)
+  # end
+  
   def set_field(field_name, value)
     instance_variable_set("@#{field_name}".to_sym, value)
   end
@@ -197,6 +207,9 @@ module RedisModel
     end
   end
   
+  # this method increments the value of the given attribute on both the server side and client side,
+  # and returns the resulting counter total
+  # No save! is required to persist the counter value to redis.
   def increment(att, increment_amt = 1)
     new_value = if self.class.fields.include?(att)
                   redis.hincrby(key_prefix, att, increment_amt)
@@ -211,6 +224,9 @@ module RedisModel
     new_value
   end
   
+  # this method decrements the value of the given attribute on both the server side and client side,
+  # and returns the resulting counter total
+  # No save! is required to persist the counter value to redis.
   def decrement(att, decrement_amt = 1)
     new_value = if self.class.fields.include?(att)
                   redis.hincrby(key_prefix, att, -decrement_amt)
@@ -234,6 +250,8 @@ module RedisModel
   end
   
   def key_for_has_many_relation_on_other_model(model_class_name, model_object_id, reverse_relation_name)
+    # resolved_model_class = resolve_classname_to_class(model_class_name)
+    # "#{resolved_model_class.name}:#{model_object_id}:#{reverse_relation_name}"
     "#{model_class_name}:#{model_object_id}:#{reverse_relation_name}"
   end
   
@@ -329,7 +347,7 @@ module RedisModel
   def unmarshal(attribute, value)
     method = "unmarshal_#{attribute}".to_sym
     if respond_to? method
-      send(method)
+      send(method, value)
     else
       value
     end
@@ -347,10 +365,11 @@ module RedisModel
   def register_in_has_many_relation_on(local_relation_name, other_model_class_name, other_model_has_many_relation)
     # redis.sadd(other_model_object.key_for_has_many_relation(other_model_has_many_relation), self.id)
     local_relation_name_sym = "#{local_relation_name}_id".to_sym
-    model_id = self.send(local_relation_name_sym)
-    if(model_id)
-      redis.sadd(key_for_has_many_relation_on_other_model(other_model_class_name, model_id, other_model_has_many_relation), self.id)
-      update_last_saved_belongs_to_model_id(local_relation_name_sym, model_id)
+    current_related_model_id = self.send(local_relation_name_sym)
+    last_saved_model_id = self.send("#{local_relation_name}_id_last_saved".to_sym)
+    if(current_related_model_id && last_saved_model_id != current_related_model_id)
+      redis.sadd(key_for_has_many_relation_on_other_model(other_model_class_name, current_related_model_id, other_model_has_many_relation), self.id)
+      update_last_saved_belongs_to_model_id(local_relation_name_sym, current_related_model_id)
     end
   end
   
@@ -385,26 +404,33 @@ module RedisModel
     
     attrs = attrs + identify_and_convert_id_field_names(attrs)
     
-    unflag_changed_fields(attrs)
-    
+    # save the new field values in Redis
     # we only want to call set_remote_attribute for attributes that were defined with the 'field' method/"macro".
     (attrs & self.class.fields).each do |attribute|
       set_remote_attribute(attribute, marshal(attribute))
     end
     
-    # iterate over all belongs_to relations and add this model object's id to the redis set
-    # with a key-name of "<relation model class name>:id:relation"
+    # now, for each field we saved, remove the flag that says that the field has been "changed"
+    # in other words, reset the "changed" flag on the fields we just saved.
+    unflag_changed_fields(attrs)
+    
+    # Now, tear down any relationships with model objects that this object is no longer related to,
+    #   and record relationships with the model objects that this object is now related to.
+    # In other words, remove old relationships, add new relationships.
+    # We accomplish this by doing the following:
+    #   Iterate over all belongs_to relations and add this model object's id to the redis set
+    #   with a key-name of "<relation model class name>:id:relation"
     self.class.belongs_to_relations.each do |relation_3_tuple|
       # each tuple is o the form: [relation_name, other_model_class_name, reverse_relation]
       local_relation_name = relation_3_tuple[0]
-      reverse_relation_class_name = relation_3_tuple[1]   # second item in the tuple is the class name of the model which has the has_many relation with this model class
-      reverse_relation_name = relation_3_tuple[2]         # the third item in the tuple is the relation name on the other model
+      other_model_class_name = relation_3_tuple[1]   # second item in the tuple is the class name of the model which has the has_many relation with this model class
+      reverse_relation = relation_3_tuple[2]         # the third item in the tuple is the relation name on the other model
       
       local_relation_name_sym = "#{local_relation_name}_id".to_sym
       
       # if attrs.include?(local_relation_name_sym)
-        unregister_from_has_many_relation_on(local_relation_name, reverse_relation_class_name, reverse_relation_name)
-        register_in_has_many_relation_on(local_relation_name, reverse_relation_class_name, reverse_relation_name)
+        unregister_from_has_many_relation_on(local_relation_name, other_model_class_name, reverse_relation)
+        register_in_has_many_relation_on(local_relation_name, other_model_class_name, reverse_relation)
       # end
     end
   end

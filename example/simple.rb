@@ -5,64 +5,64 @@ require 'colony'
 def main
   c = Colony::Client.new(['localhost:11300'], {host: 'localhost'})
 
-  puts '************** POLLING **************'
-  
-  result0 = c.task(:multiply, [1, 2, 3])
-  puts "result0 = c.task(:multiply, [1, 2, 3])"
-  
-  begin
-    val = result0.value(0)
-    puts "result0.value(0) -> #{val}"
-  end until val
-  
-  result1 = c.task(:delayed_multiply, [1, 2, 3])
-  puts "result1 = c.task(:delayed_multiply, [1, 2, 3])"
-  
-  begin
-    val = result1.value(1)
-    puts "result1.value(1) -> #{val}"
-  end until val
-  
-  result2 = c.task(:multiply, [4, 5, 6])
-  puts "result2 = c.task(:multiply, [4, 5, 6])"
-  
-  begin
-    val = result2.value
-    puts "result2.value -> #{val}"
-  end until val
-  
-  
-  puts '************** BLOCKING **************'
-  
-  result3 = c.task(:delayed_multiply, [1, 2, 3], true)
-  puts "result3 = c.task(:delayed_multiply, [1, 2, 3], true)"
-  
-  begin
-    val = result3.value
-    puts "c.task(:multiply, [1, 2, 3], true) -> #{val}"
-  end until val
-  
-  result4 = c.task(:multiply, [4, 5, 6], true)
-  puts "result4 = c.task(:multiply, [4, 5, 6], true)"
-  
-  begin
-    val = result4.value
-    puts "c.task(:multiply, [4, 5, 6], true) -> #{val}"
-  end until val
-  
-  
-  puts '************** Module Method **************'
-  
-  result5 = c.task("MyFunctions.sqrt", [29], true)
-  puts "c.task(\"MyFunctions.sqrt\", [29], true) -> #{result5.value}"
-  
-  
-  puts '************** Callbacks **************'
-  
-  puts "This task should cause the worker process to print a message with this"
-  puts "task's redis id and this task's result (i.e. return value) URI."
-  result6 = c.task("MyFunctions.sqrt", [25], true, :print_hi_on_worker)
-  puts "c.task(\"MyFunctions.sqrt\", [25], true, :print_hi_on_worker) -> #{result6.value}"
+  # puts '************** POLLING **************'
+  # 
+  # result0 = c.task(:multiply, [1, 2, 3])
+  # puts "result0 = c.task(:multiply, [1, 2, 3])"
+  # 
+  # begin
+  #   val = result0.value(0)
+  #   puts "result0.value(0) -> #{val}"
+  # end until val
+  # 
+  # result1 = c.task(:delayed_multiply, [1, 2, 3])
+  # puts "result1 = c.task(:delayed_multiply, [1, 2, 3])"
+  # 
+  # begin
+  #   val = result1.value(1)
+  #   puts "result1.value(1) -> #{val}"
+  # end until val
+  # 
+  # result2 = c.task(:multiply, [4, 5, 6])
+  # puts "result2 = c.task(:multiply, [4, 5, 6])"
+  # 
+  # begin
+  #   val = result2.value
+  #   puts "result2.value -> #{val}"
+  # end until val
+  # 
+  # 
+  # puts '************** BLOCKING **************'
+  # 
+  # result3 = c.task(:delayed_multiply, [1, 2, 3], true)
+  # puts "result3 = c.task(:delayed_multiply, [1, 2, 3], true)"
+  # 
+  # begin
+  #   val = result3.value
+  #   puts "c.task(:multiply, [1, 2, 3], true) -> #{val}"
+  # end until val
+  # 
+  # result4 = c.task(:multiply, [4, 5, 6], true)
+  # puts "result4 = c.task(:multiply, [4, 5, 6], true)"
+  # 
+  # begin
+  #   val = result4.value
+  #   puts "c.task(:multiply, [4, 5, 6], true) -> #{val}"
+  # end until val
+  # 
+  # 
+  # puts '************** Module Method **************'
+  # 
+  # result5 = c.task("MyFunctions.sqrt", [29], true)
+  # puts "c.task(\"MyFunctions.sqrt\", [29], true) -> #{result5.value}"
+  # 
+  # 
+  # puts '************** Callbacks **************'
+  # 
+  # puts "This task should cause the worker process to print a message with this"
+  # puts "task's redis id and this task's result (i.e. return value) URI."
+  # result6 = c.task("MyFunctions.sqrt", [25], true, :print_hi_on_worker)
+  # puts "c.task(\"MyFunctions.sqrt\", [25], true, :print_hi_on_worker) -> #{result6.value}"
 
   
   puts '************** Job with subtasks **************'
@@ -73,6 +73,8 @@ def main
   
   # there should be 34 slices, and therefore 34 tasks
   tasks = slices.map {|slice| j.task(:multiply, slice) }
+  
+  tasks.each {|t| pp t }
   
   j.enqueue_tasks
   j.join

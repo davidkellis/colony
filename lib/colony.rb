@@ -4,6 +4,7 @@ require 'beanstalk-client'
 require 'leiri'
 require 'redismodel'
 require 'uuidtools'
+require 'yaml'
 
 TOPLEVEL = self
 
@@ -25,7 +26,9 @@ module Colony
     NEW_TASK = :colony_new
     STATUS = :colony_status
   end
-  
+
+  # Message classes that include Message must also include RedisModel
+  # because Message calls key_prefix, a method defined in RedisModel.
   module Message
     # Message types
     SIMPLE_TASK = :task
@@ -60,6 +63,8 @@ module Colony
     end
   end
   
+  # All TaskMessage classes have 6 fields: fn, args, callback, result_uri, notify, and status
+  # Classes that include TaskMessage must include Message before including TaskMessage.
   module TaskMessage
     def self.included(mod)
       mod.class_eval do
@@ -72,13 +77,29 @@ module Colony
       end
     end
     
+    def marshal_callback
+      YAML.dump(callback)
+    end
+    
+    def marshal_notify
+      YAML.dump(notify)
+    end
+    
+    def unmarshal_callback(stored_value)
+      YAML.load(stored_value)
+    end
+    
+    def unmarshal_notify(stored_value)
+      YAML.load(stored_value)
+    end
+    
     def enqueue(tube = Tubes::NEW_TASK)
       super(tube)
     end
     
     def enqueue_callback(tube = Tubes::NEW_TASK)
-      if callback
-        callback_task = SimpleTask.create(redis, fn: self.callback, args: [self.full_id, self.result_uri], pool: pool)
+      if callback && callback.length > 0
+        callback_task = SimpleTask.create(redis, fn: callback, args: [self.full_id, self.result_uri], pool: pool)
         message_id = callback_task.enqueue(tube)
       end
     end
@@ -96,48 +117,10 @@ module Colony
       
       poll_for_result
       
-      # listen for task completion notification if the task is set up to do that
-      if notify && pool
-        pool.watch(tube_name)           # subscribe to the task-specific tube
-        
-        begin
-          
-          # if we already have a result_uri, just clear any message off the queue
-          if result_uri
-            if pool.peek_ready
-              msg = pool.reserve(0)        # poll the queue for a pre-existing message. Timeout immediately if there is no message.
-              msg.delete if msg             # delete the message, we don't need it
-            end
-          else      # we don't already have a result_uri, so listen for one
-            msg = pool.reserve(timeout)    # listen for a message; timeout if there is no message within the given timeout period.
-            if msg
-              msg.delete                    # remove the message from the queue
-              
-              notification_task = msg.ybody
-              
-              @result = notification_task.download_result
-            end
-          end
-        
-        # rescue Beanstalk::TimedOut => e
-        #   retry
-        ensure
-          pool.ignore(tube_name)       # stop watching the queue
-        end
-      elsif result_uri.nil?     # we're not setup to listen to a queue for task-completion, so poll for a result if we don't already have one
-        if timeout              # we need to poll for a result for timeout seconds
-          timeout.to_i.times do
-            sleep(1)            # sleep for one second
-            poll_for_result     # poll for a result
-            break if @result    # break out if we finally have a result
-          end
-        else
-          loop do
-            sleep(1)            # sleep for one second
-            poll_for_result     # poll for a result
-            break if @result    # break out if we finally have a result
-          end
-        end
+      if notify && pool       # listen for task completion notification if the task is set up to do that
+        listen_for_result_notification(timeout)
+      elsif result_uri.nil?   # wait for a result if we don't already have one
+        wait_for_result(timeout)
       end
       
       @result
@@ -160,12 +143,56 @@ module Colony
       if result_uri
         uri = LegacyExtendedIRI.new(result_uri)       # uri will be something like this: "redis://127.0.0.1:6379/0/12345"
         db, result_id = uri.path.split('/').drop(1)
-      
+        
         redis = Redis.new(:host => uri.host || "127.0.0.1", :port => uri.port || 6379, :db => db || 0)
         @result = redis.get(result_id)
         redis.quit
         
         @result
+      end
+    end
+    
+    def listen_for_result_notification(timeout)
+      pool.watch(tube_name)           # subscribe to the task-specific tube
+      
+      begin
+        # if we already have a result_uri, just clear any message off the queue
+        if result_uri
+          if pool.peek_ready
+            msg = pool.reserve(0)        # poll the queue for a pre-existing message. Timeout immediately if there is no message.
+            msg.delete if msg             # delete the message, we don't need it
+          end
+        else      # we don't already have a result_uri, so listen for one
+          msg = pool.reserve(timeout)    # listen for a message; timeout if there is no message within the given timeout period.
+          if msg
+            msg.delete                    # remove the message from the queue
+            
+            notification_task = msg.ybody
+            
+            @result = notification_task.download_result   # NOTE: we assume that the notification task has a valid result_id
+          end
+        end
+      
+      # rescue Beanstalk::TimedOut => e
+      #   retry
+      ensure
+        pool.ignore(tube_name)       # stop watching the queue
+      end
+    end
+    
+    def wait_for_result(timeout)
+      if timeout              # we need to poll for a result for timeout seconds
+        timeout.to_i.times do
+          sleep(1)            # sleep for one second
+          poll_for_result     # poll for a result
+          break if @result    # break out if we finally have a result
+        end
+      else
+        loop do
+          sleep(1)            # sleep for one second
+          poll_for_result     # poll for a result
+          break if @result    # break out if we finally have a result
+        end
       end
     end
   end
@@ -185,7 +212,7 @@ module Colony
     include Message
     include TaskMessage
     
-    belongs_to :job, 'Job', :tasks
+    belongs_to :job, 'Colony::Job', :tasks
     
     def initialize(attrs = {})
       super(attrs.merge(type: Message::JOB_TASK))
@@ -211,7 +238,23 @@ module Colony
     field :task_count
     field :completed_task_count
     
-    has_many :tasks, 'JobTask'
+    has_many :tasks, 'Colony::JobTask'
+    
+    def marshal_callback
+      YAML.dump(callback)
+    end
+    
+    def marshal_notify
+      YAML.dump(notify)
+    end
+    
+    def unmarshal_callback(stored_value)
+      YAML.load(stored_value)
+    end
+    
+    def unmarshal_notify(stored_value)
+      YAML.load(stored_value)
+    end
     
     def initialize(attrs = {})
       super(attrs.merge(type: Message::JOB))
@@ -235,7 +278,7 @@ module Colony
     
     # call when all the job's tasks are complete
     def enqueue_callback(tube = Tubes::NEW_TASK)
-      if callback
+      if callback && callback.length > 0
         callback_task = SimpleTask.create(redis, fn: callback, args: [full_id, task_id_and_result_uri_pairs])
         callback_task.pool = @pool
         message_id = callback_task.enqueue(tube)
@@ -267,18 +310,20 @@ module Colony
                             callback: callback_fn, 
                             notify: notify_on_complete,
                             job: self)
+      task.pool = @pool
       task
     end
     
     # add all the tasks to the new_task queue
     def enqueue_tasks
-      update!(task_count: tasks.size)       # finalize the task count
+      update!(task_count: tasks(true).count)       # finalize the task count
+      puts "task count: #{tasks.count}"
       
       # iterate over all tasks and enqueue each one
-      tasks(true).each do |task|
+      tasks.each do |task|
         task.pool = self.pool
         
-        # puts 'enqueuing'
+        puts "enqueuing task #{task.id}"
         pp task
         message_id = task.enqueue
         
@@ -304,53 +349,64 @@ module Colony
     def join(timeout = nil)
       return true if complete?(false)
       
+      # this is here because of the side effect that calling complete? has: complete? retrieves the newest value of
+      # the job's status field from redis.
       is_complete = complete?
       
       # listen for task completion notification if the task is set up to do that
       if notify && pool
-        pool.watch(tube_name)           # subscribe to the task-specific tube
-        
-        begin
-          
-          # if the job is already marked complete, just clear any message off the queue
-          if is_complete
-            if pool.peek_ready
-              msg = pool.reserve(0)        # poll the queue for a pre-existing message. Timeout immediately if there is no message.
-              msg.delete if msg             # delete the message, we don't need it
-            end
-          else      # the job isn't yet marked as complete, so listen for a "this job is complete" notification message
-            msg = pool.reserve(timeout)    # listen for a message; timeout if there is no message within the given timeout period.
-            if msg
-              msg.delete                    # remove the message from the queue
-              
-              jobreference = msg.ybody      # the message is a JobReference object
-              
-              # update the current job's (self's) status attribute with the notification job's status
-              self.status = jobreference.status
-            end
-          end
-        
-        # rescue Beanstalk::TimedOut => e
-        #   retry
-        ensure
-          pool.ignore(tube_name)       # stop watching the queue
-        end
+        listen_for_completion_notification(timeout)
       elsif !is_complete    # we're not setup to listen to a queue for task-completion, so poll for job completion if the job isn't marked complete
-        if timeout                # we need to poll for a result for timeout seconds
-          timeout.to_i.times do
-            sleep(1)              # sleep for one second
-            break if complete?    # poll for completion, break out if we finally have a result
-          end
-        else
-          loop do
-            sleep(1)              # sleep for one second
-            break if complete?    # poll for completion, break out if we finally have a result
-          end
-        end
+        wait_for_completion(timeout)
       end
       
       complete?(false)            # return the local (cached) completion status
     end
+    
+    def listen_for_completion_notification(timeout)
+      pool.watch(tube_name)           # subscribe to the task-specific tube
+      
+      begin
+        
+        # if the job is already marked complete, just clear any message off the queue
+        if complete?(false)
+          if pool.peek_ready
+            msg = pool.reserve(0)        # poll the queue for a pre-existing message. Timeout immediately if there is no message.
+            msg.delete if msg             # delete the message, we don't need it
+          end
+        else      # the job isn't yet marked as complete, so listen for a "this job is complete" notification message
+          msg = pool.reserve(timeout)    # listen for a message; timeout if there is no message within the given timeout period.
+          if msg
+            msg.delete                    # remove the message from the queue
+            
+            jobreference = msg.ybody      # the message is a JobReference object
+            
+            # update the current job's (self's) status attribute with the notification job reference's status
+            self.status = jobreference.status
+          end
+        end
+      
+      # rescue Beanstalk::TimedOut => e
+      #   retry
+      ensure
+        pool.ignore(tube_name)       # stop watching the queue
+      end
+    end
+    
+    def wait_for_completion(timeout)
+      if timeout                # we need to poll for a result for timeout seconds
+        timeout.to_i.times do
+          sleep(1)              # sleep for one second
+          break if complete?    # poll for completion, break out if we finally have a result
+        end
+      else
+        loop do
+          sleep(1)              # sleep for one second
+          break if complete?    # poll for completion, break out if we finally have a result
+        end
+      end
+    end
+    
   end
   
   class Client
@@ -411,6 +467,8 @@ module Colony
         
         task.pool = @pool
         task.redis = @global_redis_server
+        
+        # task.reload!([:callback, :notify])
         
         task.update!(status: States::RUNNING)
         
